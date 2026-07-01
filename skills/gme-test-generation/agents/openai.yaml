@@ -1,0 +1,4 @@
+interface:
+  display_name: "GME 测试生成"
+  short_description: "生成 GME vs ACIS 对比测试"
+  default_prompt: "为选中模块/API 生成聚焦的 GME vs ACIS GoogleTest 对比测试。"

@@ -1,0 +1,219 @@
+from __future__ import annotations
+
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from urllib.parse import parse_qs, urlparse
+from dataclasses import asdict
+import json
+
+from ..services.orchestrator import Orchestrator
+from ..settings.config import AgentConfig, config_from_json, load_config, save_config
+from ..settings.options import load_config_options
+from ..settings.validation import validate_config
+from ..storage.db import AgentDb
+
+
+class ServerState:
+    def __init__(self, config_path: Path):
+        self.config_path = config_path
+        self.config = load_config(config_path)
+        self.db = AgentDb(self.config.database_path)
+        self.orchestrator = Orchestrator(self.config, self.db)
+
+    def update_config(self, data: dict[str, Any]) -> AgentConfig:
+        self.config = config_from_json(data, self.config)
+        save_config(self.config_path, self.config)
+        self.db = AgentDb(self.config.database_path)
+        self.orchestrator = Orchestrator(self.config, self.db)
+        return self.config
+
+
+def run_server(config_path: Path, host: str, port: int) -> None:
+    state = ServerState(config_path)
+
+    class Handler(ApiHandler):
+        server_state = state
+
+    httpd = ThreadingHTTPServer((host, port), Handler)
+    print(f"GME Test Agent backend listening on http://{host}:{port}")
+    httpd.serve_forever()
+
+
+class ApiHandler(BaseHTTPRequestHandler):
+    server_state: ServerState
+
+    def do_OPTIONS(self) -> None:
+        self._send_json({"ok": True})
+
+    def do_GET(self) -> None:
+        try:
+            path, query = self._path()
+            if path == "/api/health":
+                self._send_json({"ok": True})
+            elif path == "/api/config":
+                self._send_json(asdict(self.server_state.config))
+            elif path == "/api/validate":
+                self._send_json(validate_config(self.server_state.config))
+            elif path == "/api/options":
+                self._send_json(load_config_options(self.server_state.config))
+            elif path == "/api/jobs":
+                self._send_json({"jobs": self.server_state.db.list_jobs()})
+            elif path == "/api/failures":
+                self._send_json({"failures": self.server_state.db.list_failures()})
+            elif path.startswith("/api/failures/"):
+                failure_id = path.split("/")[3]
+                self._send_json(self.server_state.db.get_failure(failure_id))
+            elif path.startswith("/api/jobs/") and path.endswith("/events"):
+                job_id = path.split("/")[3]
+                after = int(query.get("after", ["0"])[0])
+                self._send_json({"events": self.server_state.db.list_events(job_id, after)})
+            elif path.startswith("/api/jobs/") and path.endswith("/artifacts"):
+                job_id = path.split("/")[3]
+                self._send_json(self._job_artifacts(job_id))
+            elif path.startswith("/api/jobs/"):
+                job_id = path.split("/")[3]
+                self._send_json(self.server_state.db.get_job(job_id))
+            else:
+                self._send_error(HTTPStatus.NOT_FOUND, f"Unknown endpoint: {path}")
+        except Exception as exc:
+            self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+
+    def do_POST(self) -> None:
+        try:
+            path, _ = self._path()
+            data = self._read_json()
+            if path == "/api/config":
+                config = self.server_state.update_config(data)
+                self._send_json(asdict(config))
+            elif path == "/api/jobs/test-generation":
+                job = self.server_state.orchestrator.create_test_generation_job(
+                    module=str(data.get("module") or "gme"),
+                    api_name=str(data.get("api_name") or ""),
+                )
+                self._send_json(job, HTTPStatus.ACCEPTED)
+            elif path.startswith("/api/jobs/") and path.endswith("/extend-tests"):
+                job_id = path.split("/")[3]
+                job = self.server_state.orchestrator.extend_test_generation_job(
+                    job_id,
+                    api_name=str(data.get("api_name") or ""),
+                )
+                self._send_json(job, HTTPStatus.ACCEPTED)
+            elif path.startswith("/api/jobs/") and path.endswith("/run-tests"):
+                job_id = path.split("/")[3]
+                job = self.server_state.orchestrator.run_tests_for_job(
+                    job_id,
+                    gtest_filter=str(data.get("gtest_filter") or "*"),
+                )
+                self._send_json(job, HTTPStatus.ACCEPTED)
+            elif path.startswith("/api/jobs/") and path.endswith("/build"):
+                job_id = path.split("/")[3]
+                job = self.server_state.orchestrator.build_job(job_id)
+                self._send_json(job, HTTPStatus.ACCEPTED)
+            elif path.startswith("/api/jobs/") and path.endswith("/create-pr"):
+                job_id = path.split("/")[3]
+                job = self.server_state.orchestrator.create_pr_for_job(job_id)
+                self._send_json(job, HTTPStatus.ACCEPTED)
+            elif path.startswith("/api/jobs/") and path.endswith("/skip-pr"):
+                job_id = path.split("/")[3]
+                job = self.server_state.orchestrator.create_skip_pr_for_job(job_id)
+                self._send_json(job, HTTPStatus.ACCEPTED)
+            elif path.startswith("/api/jobs/") and path.endswith("/cleanup"):
+                job_id = path.split("/")[3]
+                job = self.server_state.orchestrator.cleanup_job_worktree(job_id)
+                self._send_json(job, HTTPStatus.ACCEPTED)
+            elif path.startswith("/api/jobs/") and path.endswith("/delete"):
+                job_id = path.split("/")[3]
+                result = self.server_state.orchestrator.delete_job(
+                    job_id,
+                    cleanup_worktree=bool(data.get("cleanup_worktree", True)),
+                    delete_artifacts=bool(data.get("delete_artifacts", True)),
+                )
+                self._send_json(result)
+            elif path.startswith("/api/failures/") and path.endswith("/fix"):
+                failure_id = path.split("/")[3]
+                job = self.server_state.orchestrator.create_fix_job(failure_id)
+                self._send_json(job, HTTPStatus.ACCEPTED)
+            elif path.startswith("/api/failures/") and path.endswith("/status"):
+                failure_id = path.split("/")[3]
+                failure = self.server_state.orchestrator.update_failure_status(
+                    failure_id,
+                    str(data.get("status") or "open"),
+                )
+                self._send_json(failure)
+            else:
+                self._send_error(HTTPStatus.NOT_FOUND, f"Unknown endpoint: {path}")
+        except Exception as exc:
+            self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+
+    def log_message(self, fmt: str, *args: Any) -> None:
+        print("%s - %s" % (self.address_string(), fmt % args))
+
+    def _path(self) -> tuple[str, dict[str, list[str]]]:
+        parsed = urlparse(self.path)
+        return parsed.path, parse_qs(parsed.query)
+
+    def _read_json(self) -> dict[str, Any]:
+        length = int(self.headers.get("Content-Length") or "0")
+        if length == 0:
+            return {}
+        raw = self.rfile.read(length).decode("utf-8")
+        return json.loads(raw or "{}")
+
+    def _send_json(self, data: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
+        body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_error(self, status: HTTPStatus, message: str) -> None:
+        self._send_json({"error": message}, status)
+
+    def _job_artifacts(self, job_id: str) -> dict[str, Any]:
+        job = self.server_state.db.get_job(job_id)
+        metadata = job.get("metadata") or {}
+        artifact_dir = Path(metadata.get("artifact_dir") or Path(self.server_state.config.artifact_root) / job_id)
+        names = [
+            "manifest.json",
+            "diff.patch",
+            "codex_result.txt",
+            "codex_extend_result.txt",
+            "codex_skip_result.txt",
+            "gtest_output.txt",
+            "gtest_output_after_skip.txt",
+            "gtest_reproduce_before_fix.txt",
+            "gtest_verify_after_fix.txt",
+            "test_generation_prompt.md",
+            "test_generation_extend_prompt.md",
+            "bug_fix_prompt.md",
+            "skip_prompt.md",
+        ]
+        files = []
+        contents: dict[str, str] = {}
+        if artifact_dir.exists():
+            for path in sorted(artifact_dir.iterdir()):
+                if path.is_file():
+                    files.append({"name": path.name, "size": path.stat().st_size})
+            for name in names:
+                path = artifact_dir / name
+                if path.exists() and path.is_file():
+                    contents[name] = path.read_text(encoding="utf-8", errors="replace")
+        worktree_path = str(job.get("worktree_path") or "")
+        if worktree_path:
+            notes_dir = Path(worktree_path) / ".gme-agent"
+            if notes_dir.exists():
+                for path in sorted(notes_dir.glob("*.md")):
+                    key = f".gme-agent/{path.name}"
+                    files.append({"name": key, "size": path.stat().st_size})
+                    contents[key] = path.read_text(encoding="utf-8", errors="replace")
+        return {
+            "artifact_dir": str(artifact_dir),
+            "files": files,
+            "contents": contents,
+        }

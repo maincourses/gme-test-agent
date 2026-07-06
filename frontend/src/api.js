@@ -33,6 +33,11 @@ export const api = {
   buildJob: (jobId, data) => request(`/jobs/${encodeURIComponent(jobId)}/build`, { method: "POST", body: JSON.stringify(data) }),
   runTests: (jobId, data) => request(`/jobs/${encodeURIComponent(jobId)}/run-tests`, { method: "POST", body: JSON.stringify(data) }),
   createSkipPr: (jobId) => request(`/jobs/${encodeURIComponent(jobId)}/skip-pr`, { method: "POST", body: "{}" }),
+  deleteGeneratedTests: (jobId, tests) =>
+    request(`/jobs/${encodeURIComponent(jobId)}/generated-tests/remove`, {
+      method: "POST",
+      body: JSON.stringify({ tests }),
+    }),
   cleanupJob: (jobId) => request(`/jobs/${encodeURIComponent(jobId)}/cleanup`, { method: "POST", body: "{}" }),
   deleteJob: (jobId, data) =>
     request(`/jobs/${encodeURIComponent(jobId)}/delete`, {

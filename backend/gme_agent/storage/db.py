@@ -175,6 +175,21 @@ class AgentDb:
                 ).rowcount
         return deleted
 
+    def delete_failures_for_tests(self, job_id: str, test_keys: list[tuple[str, str]]) -> int:
+        if not test_keys:
+            return 0
+        deleted = 0
+        with self._lock, self._conn:
+            for suite, test in test_keys:
+                deleted += self._conn.execute(
+                    """
+                    delete from failures
+                    where job_id = ? and test_suite = ? and test_name = ?
+                    """,
+                    (job_id, suite, test),
+                ).rowcount
+        return deleted
+
     def add_event(self, job_id: str, level: str, message: str) -> None:
         with self._lock, self._conn:
             self._conn.execute(

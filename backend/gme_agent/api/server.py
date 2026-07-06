@@ -93,50 +93,47 @@ class ApiHandler(BaseHTTPRequestHandler):
                     api_name=str(data.get("api_name") or ""),
                 )
                 self._send_json(job, HTTPStatus.ACCEPTED)
-            elif path.startswith("/api/jobs/") and path.endswith("/extend-tests"):
-                job_id = path.split("/")[3]
+            elif job_id := _match_job_action(path, "extend-tests"):
                 job = self.server_state.orchestrator.extend_test_generation_job(
                     job_id,
                     api_name=str(data.get("api_name") or ""),
                 )
                 self._send_json(job, HTTPStatus.ACCEPTED)
-            elif path.startswith("/api/jobs/") and path.endswith("/run-tests"):
-                job_id = path.split("/")[3]
+            elif job_id := _match_job_action(path, "run-tests"):
                 job = self.server_state.orchestrator.run_tests_for_job(
                     job_id,
                     gtest_filter=str(data.get("gtest_filter") or "*"),
                 )
                 self._send_json(job, HTTPStatus.ACCEPTED)
-            elif path.startswith("/api/jobs/") and path.endswith("/build"):
-                job_id = path.split("/")[3]
+            elif job_id := _match_job_action(path, "build"):
                 job = self.server_state.orchestrator.build_job(job_id)
                 self._send_json(job, HTTPStatus.ACCEPTED)
-            elif path.startswith("/api/jobs/") and path.endswith("/create-pr"):
-                job_id = path.split("/")[3]
+            elif job_id := _match_job_action(path, "create-pr"):
                 job = self.server_state.orchestrator.create_pr_for_job(job_id)
                 self._send_json(job, HTTPStatus.ACCEPTED)
-            elif path.startswith("/api/jobs/") and path.endswith("/skip-pr"):
-                job_id = path.split("/")[3]
+            elif job_id := _match_job_action(path, "skip-pr"):
                 job = self.server_state.orchestrator.create_skip_pr_for_job(job_id)
                 self._send_json(job, HTTPStatus.ACCEPTED)
-            elif path.startswith("/api/jobs/") and path.endswith("/cleanup"):
-                job_id = path.split("/")[3]
+            elif job_id := (_match_job_action(path, "generated-tests", "remove") or _match_job_action(path, "generated-tests", "delete")):
+                job = self.server_state.orchestrator.delete_generated_tests_for_job(
+                    job_id,
+                    list(data.get("tests") or []),
+                )
+                self._send_json(job)
+            elif job_id := _match_job_action(path, "cleanup"):
                 job = self.server_state.orchestrator.cleanup_job_worktree(job_id)
                 self._send_json(job, HTTPStatus.ACCEPTED)
-            elif path.startswith("/api/jobs/") and path.endswith("/delete"):
-                job_id = path.split("/")[3]
+            elif job_id := _match_job_action(path, "delete"):
                 result = self.server_state.orchestrator.delete_job(
                     job_id,
                     cleanup_worktree=bool(data.get("cleanup_worktree", True)),
                     delete_artifacts=bool(data.get("delete_artifacts", True)),
                 )
                 self._send_json(result)
-            elif path.startswith("/api/failures/") and path.endswith("/fix"):
-                failure_id = path.split("/")[3]
+            elif failure_id := _match_failure_action(path, "fix"):
                 job = self.server_state.orchestrator.create_fix_job(failure_id)
                 self._send_json(job, HTTPStatus.ACCEPTED)
-            elif path.startswith("/api/failures/") and path.endswith("/status"):
-                failure_id = path.split("/")[3]
+            elif failure_id := _match_failure_action(path, "status"):
                 failure = self.server_state.orchestrator.update_failure_status(
                     failure_id,
                     str(data.get("status") or "open"),
@@ -208,7 +205,7 @@ class ApiHandler(BaseHTTPRequestHandler):
         if worktree_path:
             notes_dir = Path(worktree_path) / ".gme-agent"
             if notes_dir.exists():
-                for path in sorted(notes_dir.glob("*.md")):
+                for path in sorted([*notes_dir.glob("*.md"), *notes_dir.glob("*.json")]):
                     key = f".gme-agent/{path.name}"
                     files.append({"name": key, "size": path.stat().st_size})
                     contents[key] = path.read_text(encoding="utf-8", errors="replace")
@@ -217,3 +214,19 @@ class ApiHandler(BaseHTTPRequestHandler):
             "files": files,
             "contents": contents,
         }
+
+
+def _match_job_action(path: str, *action: str) -> str:
+    parts = [part for part in path.split("/") if part]
+    expected_len = 3 + len(action)
+    if len(parts) != expected_len or parts[:2] != ["api", "jobs"] or parts[3:] != list(action):
+        return ""
+    return parts[2]
+
+
+def _match_failure_action(path: str, *action: str) -> str:
+    parts = [part for part in path.split("/") if part]
+    expected_len = 3 + len(action)
+    if len(parts) != expected_len or parts[:2] != ["api", "failures"] or parts[3:] != list(action):
+        return ""
+    return parts[2]

@@ -21,7 +21,9 @@ from gme_agent.git.repositories import (
 from gme_agent.git.worktree import normalize_repo_path
 from gme_agent.execution.runner import merge_failures, parse_gtest_failures, parse_gtest_xml
 from gme_agent.flows.skip_pr_flow import (
+    _failure_suite_filter,
     _format_generated_tests,
+    _prune_manifest_tests_to_failures,
     _prune_generated_test_text,
     _restore_generated_tests,
     _skip_pr_branch_name,
@@ -29,7 +31,14 @@ from gme_agent.flows.skip_pr_flow import (
     _skip_pr_title,
     _snapshot_generated_tests,
 )
+from gme_agent.flows.generated_test_edit_flow import delete_generated_tests
+from gme_agent.generated_tests import (
+    ensure_generated_tests_use_existing_files,
+    load_generated_tests_manifest,
+    require_generated_tests_manifest,
+)
 from gme_agent.services.orchestrator import Orchestrator
+from gme_agent.api.server import _match_job_action
 from gme_agent.prompts import (
     continue_test_generation_prompt,
     skip_known_failure_prompt,
@@ -120,6 +129,92 @@ class CoreTests(unittest.TestCase):
             finally:
                 db.close()
 
+    def test_job_action_route_does_not_match_nested_delete_paths(self) -> None:
+        self.assertEqual(_match_job_action("/api/jobs/job-1/delete", "delete"), "job-1")
+        self.assertEqual(_match_job_action("/api/jobs/job-1/generated-tests/delete", "delete"), "")
+        self.assertEqual(_match_job_action("/api/jobs/job-1/generated-tests/remove", "generated-tests", "remove"), "job-1")
+
+    def test_delete_generated_tests_updates_files_manifest_metadata_and_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "worktree"
+            target = worktree / "tests" / "gme"
+            test_rel = "src/laws/generated_test.cpp"
+            self._init_repo(
+                target,
+                test_rel,
+                """#include "gtest/gtest.h"
+
+TEST_F(Suite, ManualCase) {
+    EXPECT_TRUE(true);
+}
+
+/**
+ * generated case A
+ */
+TEST_F(Suite, GeneratedA) {
+    EXPECT_TRUE(true);
+}
+
+TEST_F(Suite, GeneratedB) {
+    EXPECT_TRUE(false);
+}
+""",
+            )
+            notes = worktree / ".gme-agent"
+            notes.mkdir(parents=True)
+            (notes / "generated_tests.json").write_text(
+                """
+{
+  "tests": [
+    {"file": "src/laws/generated_test.cpp", "suite": "Suite", "name": "GeneratedA", "api": "api_a"},
+    {"file": "src/laws/generated_test.cpp", "suite": "Suite", "name": "GeneratedB", "api": "api_b"}
+  ]
+}
+""",
+                encoding="utf-8",
+            )
+            cfg = AgentConfig(
+                artifact_root=str(root / "artifacts"),
+                database_path=str(root / "agent.db"),
+                test_target_repo="tests/gme",
+            )
+            db = AgentDb(cfg.database_path)
+            try:
+                job = db.create_job(
+                    job_id="job-1",
+                    job_type="test_generation",
+                    title="Generate laws tests",
+                    module="laws",
+                    metadata={"target_repo": "tests/gme"},
+                )
+                db.update_job(
+                    job["id"],
+                    worktree_path=str(worktree),
+                    metadata={
+                        "target_repo": "tests/gme",
+                        "generated_tests": load_generated_tests_manifest(worktree, "tests/gme")["tests"],
+                    },
+                )
+                db.create_failure(failure_id="failure-a", job_id=job["id"], test_suite="Suite", test_name="GeneratedA")
+                db.create_failure(failure_id="failure-b", job_id=job["id"], test_suite="Suite", test_name="GeneratedB")
+                orchestrator = Orchestrator(cfg, db)
+
+                updated = delete_generated_tests(orchestrator, job["id"], [{"suite": "Suite", "name": "GeneratedA"}])
+
+                content = (target / test_rel).read_text(encoding="utf-8")
+                self.assertIn("TEST_F(Suite, ManualCase)", content)
+                self.assertNotIn("GeneratedA", content)
+                self.assertNotIn("generated case A", content)
+                self.assertIn("TEST_F(Suite, GeneratedB)", content)
+                manifest = load_generated_tests_manifest(worktree, "tests/gme")
+                self.assertEqual([(test["suite"], test["name"]) for test in manifest["tests"]], [("Suite", "GeneratedB")])
+                self.assertEqual(updated["metadata"]["generated_gtest_filter"], "Suite.GeneratedB")
+                self.assertEqual([failure["id"] for failure in db.list_failures()], ["failure-b"])
+                self.assertTrue((Path(cfg.artifact_root) / job["id"] / "diff.patch").exists())
+            finally:
+                db.close()
+
     def test_parse_gtest_failures(self) -> None:
         output = """
         D:/GME/tests/gme/src/laws/foo_test.cpp:42: Failure
@@ -174,7 +269,7 @@ class CoreTests(unittest.TestCase):
             "test output",
             [{"id": "gmefail-1", "test_suite": "Suite", "test_name": "Case", "file": "x.cpp", "line": 12, "reason": "mismatch"}],
             "tests/gme",
-            ["tests/gme/src/base/gme_agent_base_generated_test.cpp"],
+            ["tests/gme/src/base/base_geometry_test.cpp"],
         )
 
         self.assertIn("GTEST_SKIP()", prompt)
@@ -182,19 +277,122 @@ class CoreTests(unittest.TestCase):
         self.assertNotIn("GME_AGENT_KNOWN_FAILURE", prompt)
         self.assertNotIn("gme_agent_known_failure.hxx", prompt)
 
-    def test_test_generation_prompt_uses_gme_release_suite_prefix(self) -> None:
+    def test_test_generation_prompt_uses_existing_files_manifest_and_no_helpers(self) -> None:
         prompt = test_generation_prompt("laws", "api_ndifferentiate_law", "tests/gme")
 
-        self.assertIn("Generated test suite: `Laws_GmeAgentGeneratedTest`", prompt)
-        self.assertIn("Suggested GTest filter: `Laws_GmeAgentGeneratedTest.*`", prompt)
-        self.assertNotIn("GmeAgentLawsGeneratedTest", prompt)
+        self.assertIn(".gme-agent/generated_tests.json", prompt)
+        self.assertIn("most relevant existing `.cpp`", prompt)
+        self.assertIn("Do not create `gme_agent_<module>_generated_test.cpp`", prompt)
+        self.assertIn("Do not add new helper functions", prompt)
+        self.assertIn("directly inside each individual `TEST_F` body", prompt)
+        self.assertIn("Write generated tests as `TEST_F` cases", prompt)
+        self.assertIn("delete any temporary files outside", prompt)
+        self.assertIn("timer_res_.csv", prompt)
+        self.assertIn("build the test target", prompt)
+        self.assertIn("Visual Studio 17 2022", prompt)
+        self.assertIn("-DDEVELOP_LAWS=ON", prompt)
+        self.assertIn("-DTEST_LAWS=ON", prompt)
+        self.assertIn("cmake --build", prompt)
+        self.assertIn("If the build fails because of tests you generated", prompt)
+        self.assertIn("After every generated-test fix, deletion, or replacement, build again", prompt)
+        self.assertIn("Repeat the build -> fix/delete/replace -> rebuild loop", prompt)
+        self.assertIn("add a replacement buildable test and rebuild again", prompt)
+        self.assertIn("any requested-count shortfall with reasons", prompt)
+        self.assertIn("delete that test and update `.gme-agent/generated_tests.md`", prompt)
+        self.assertIn("unresolved external/LNK2019", prompt)
+        self.assertIn("private/protected member access errors", prompt)
+        self.assertNotIn("Generated test suite", prompt)
 
-    def test_continue_generation_prompt_uses_gme_release_suite_prefix(self) -> None:
+    def test_continue_generation_prompt_uses_existing_files_manifest_and_no_helpers(self) -> None:
         prompt = continue_test_generation_prompt("base", "extend coverage", "tests/gme")
 
-        self.assertIn("Generated test suite: `Base_GmeAgentGeneratedTest`", prompt)
-        self.assertIn("Suggested GTest filter: `Base_GmeAgentGeneratedTest.*`", prompt)
-        self.assertNotIn("GmeAgentBaseGeneratedTest", prompt)
+        self.assertIn(".gme-agent/generated_tests.json", prompt)
+        self.assertIn("appropriate existing `.cpp` files", prompt)
+        self.assertIn("Do not create `gme_agent_<module>_generated_test.cpp`", prompt)
+        self.assertIn("Do not add new helper functions", prompt)
+        self.assertIn("directly inside each individual `TEST_F` body", prompt)
+        self.assertIn("Write generated tests as `TEST_F` cases", prompt)
+        self.assertIn("delete any temporary files outside", prompt)
+        self.assertIn("timer_res_.csv", prompt)
+        self.assertIn("build the test target", prompt)
+        self.assertIn("Visual Studio 17 2022", prompt)
+        self.assertIn("-DDEVELOP_BASE=ON", prompt)
+        self.assertIn("-DTEST_BASE=ON", prompt)
+        self.assertIn("cmake --build", prompt)
+        self.assertIn("If the build fails because of tests you generated", prompt)
+        self.assertIn("After every generated-test fix, deletion, or replacement, build again", prompt)
+        self.assertIn("Repeat the build -> fix/delete/replace -> rebuild loop", prompt)
+        self.assertIn("add a replacement buildable test and rebuild again", prompt)
+        self.assertIn("any requested-count shortfall with reasons", prompt)
+        self.assertIn("delete that test and update `.gme-agent/generated_tests.md`", prompt)
+        self.assertIn("unresolved external/LNK2019", prompt)
+        self.assertIn("private/protected member access errors", prompt)
+        self.assertNotIn("Generated test suite", prompt)
+
+    def test_generation_prompt_uses_task_specific_build_guidance(self) -> None:
+        prompt = test_generation_prompt(
+            "laws",
+            "api_ndifferentiate_law",
+            "tests/gme",
+            "Build validation commands from the GME Test Agent settings:\n- Build:\n  `custom-build-command`",
+        )
+
+        self.assertIn("custom-build-command", prompt)
+        self.assertNotIn("-DDEVELOP_LAWS=ON", prompt)
+
+    def test_generated_tests_manifest_normalizes_files_and_filter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            notes = worktree / ".gme-agent"
+            notes.mkdir()
+            (notes / "generated_tests.json").write_text(
+                """
+{
+  "tests": [
+    {
+      "file": "tests/gme/src/laws/kernel_kernapi_test.cpp",
+      "suite": "Laws_KernapiTest",
+      "name": "ApiMakeCubicAsymmetricEndpointSlopes",
+      "api": "api_make_cubic"
+    },
+    {
+      "file": "src/laws/law_main_law_test.cpp",
+      "suite": "Laws_ClassTest",
+      "name": "LawZeroConstantPredicate"
+    }
+  ]
+}
+""",
+                encoding="utf-8",
+            )
+
+            manifest = load_generated_tests_manifest(worktree, "tests/gme")
+
+            self.assertEqual(
+                manifest["files"],
+                ["src/laws/kernel_kernapi_test.cpp", "src/laws/law_main_law_test.cpp"],
+            )
+            self.assertEqual(
+                manifest["gtest_filter"],
+                "Laws_KernapiTest.ApiMakeCubicAsymmetricEndpointSlopes:Laws_ClassTest.LawZeroConstantPredicate",
+            )
+
+    def test_generated_tests_manifest_is_required(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(RuntimeError, "generated_tests.json"):
+                require_generated_tests_manifest(Path(tmp), "tests/gme")
+
+    def test_generated_tests_manifest_requires_existing_test_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            repo = worktree / "tests" / "gme"
+            self._init_repo(repo, "src/laws/existing_test.cpp", "TEST(Existing, Case) {}\n")
+            new_file = repo / "src" / "laws" / "new_agent_test.cpp"
+            new_file.write_text("TEST(New, Case) {}\n", encoding="utf-8")
+
+            ensure_generated_tests_use_existing_files(worktree, "tests/gme", ["src/laws/existing_test.cpp"])
+            with self.assertRaisesRegex(RuntimeError, "existing test files"):
+                ensure_generated_tests_use_existing_files(worktree, "tests/gme", ["src/laws/new_agent_test.cpp"])
 
     def test_commit_paths_only_commits_selected_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -263,10 +461,10 @@ class CoreTests(unittest.TestCase):
         body = _skip_pr_body(
             {"id": "job-1", "module": "base"},
             [
-                {"test_suite": "GmeAgentBaseGeneratedTest", "test_name": "GetPlaneFromPointArrayMatchesAcis"},
-                {"test_suite": "GmeAgentBaseGeneratedTest", "test_name": "MaxDistanceToParBoxMatchesAcis"},
+                {"test_suite": "BaseGeometryTest", "test_name": "GetPlaneFromPointArrayMatchesAcis"},
+                {"test_suite": "BaseGeometryTest", "test_name": "MaxDistanceToParBoxMatchesAcis"},
             ],
-            "GmeAgentBaseGeneratedTest.*",
+            "BaseGeometryTest.GetPlaneFromPointArrayMatchesAcis:BaseGeometryTest.MaxDistanceToParBoxMatchesAcis",
         )
 
         self.assertEqual(
@@ -276,10 +474,22 @@ class CoreTests(unittest.TestCase):
                     "该 PR 由 GME Test Agent 自动生成，新增 GME vs ACIS 对比测试，并对当前已确认存在差异的失败用例增加 skip。",
                     "",
                     "本次新增测试用例：",
-                    "GmeAgentBaseGeneratedTest.GetPlaneFromPointArrayMatchesAcis",
-                    "GmeAgentBaseGeneratedTest.MaxDistanceToParBoxMatchesAcis",
+                    "BaseGeometryTest.GetPlaneFromPointArrayMatchesAcis",
+                    "BaseGeometryTest.MaxDistanceToParBoxMatchesAcis",
                 ]
             ),
+        )
+
+    def test_failure_suite_filter_uses_exact_failed_tests(self) -> None:
+        self.assertEqual(
+            _failure_suite_filter(
+                [
+                    {"test_suite": "BaseGeometryTest", "test_name": "GetPlaneFromPointArrayMatchesAcis"},
+                    {"test_suite": "BaseGeometryTest", "test_name": "MaxDistanceToParBoxMatchesAcis"},
+                    {"test_suite": "BaseGeometryTest", "test_name": "GetPlaneFromPointArrayMatchesAcis"},
+                ]
+            ),
+            "BaseGeometryTest.GetPlaneFromPointArrayMatchesAcis:BaseGeometryTest.MaxDistanceToParBoxMatchesAcis",
         )
 
     def test_prune_generated_test_text_keeps_only_skipped_failures(self) -> None:
@@ -320,6 +530,48 @@ TEST_F(Suite, FailingCase) {
 
         with self.assertRaisesRegex(RuntimeError, "does not contain GTEST_SKIP"):
             _prune_generated_test_text(text, {("Suite", "FailingCase")}, "generated.cpp")
+
+    def test_prune_manifest_tests_removes_only_generated_passing_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp)
+            rel_path = "src/laws/kernel_kernapi_test.cpp"
+            file_path = target / rel_path
+            file_path.parent.mkdir(parents=True)
+            file_path.write_text(
+                """#include "gtest/include/gtest.h"
+
+TEST_F(LawsKernapiTest, ExistingManualCase) {
+    EXPECT_TRUE(true);
+}
+
+TEST_F(LawsKernapiTest, GeneratedPassingCase) {
+    EXPECT_TRUE(true);
+}
+
+TEST_F(LawsKernapiTest, GeneratedFailingCase) {
+    GTEST_SKIP() << "[gme-agent-known-failure:gmefail-1] ACIS/GME mismatch";
+    EXPECT_TRUE(false);
+}
+""",
+                encoding="utf-8",
+            )
+
+            _prune_manifest_tests_to_failures(
+                target,
+                [rel_path],
+                [{"test_suite": "LawsKernapiTest", "test_name": "GeneratedFailingCase"}],
+                [
+                    {"file": rel_path, "suite": "LawsKernapiTest", "name": "GeneratedPassingCase"},
+                    {"file": rel_path, "suite": "LawsKernapiTest", "name": "GeneratedFailingCase"},
+                ],
+                lambda _level, _message: None,
+            )
+
+            pruned = file_path.read_text(encoding="utf-8")
+            self.assertIn("TEST_F(LawsKernapiTest, ExistingManualCase)", pruned)
+            self.assertIn("TEST_F(LawsKernapiTest, GeneratedFailingCase)", pruned)
+            self.assertIn("GTEST_SKIP()", pruned)
+            self.assertNotIn("GeneratedPassingCase", pruned)
 
     def test_generated_test_snapshot_restore_keeps_local_full_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -651,6 +903,7 @@ TEST_F(Suite, FailingCase) {
             subprocess.run(["git", "commit", "-m", "init"], cwd=tmp, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
 
             (target / "existing.cpp").write_text("int old_value = 2;\n", encoding="utf-8")
+            Path(tmp, "timer_res_.csv").write_text("", encoding="utf-8")
             ensure_only_target_repo_changed(tmp, normalize_repo_path("tests\\gme"))
 
             Path(tmp, "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.20)\n", encoding="utf-8")

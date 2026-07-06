@@ -69,7 +69,7 @@ const {
         <div class="generated-target">
           <FileCode2 :size="17" />
           <div>
-            <span>生成文件</span>
+            <span>目标测试文件</span>
             <code>{{ generatedTestInfo.file }}</code>
           </div>
         </div>
@@ -107,7 +107,13 @@ const {
           </div>
           <div>
             <span>建议 Filter</span>
-            <code>{{ generatedTestInfo.filter }}</code>
+            <div class="summary-action">
+              <strong>{{ generatedTestInfo.filterSummary }}</strong>
+              <button class="ghost-button compact" type="button" @click="copyText(generatedTestInfo.filter)">
+                <Clipboard :size="14" />
+                复制 Filter
+              </button>
+            </div>
           </div>
         </div>
         <p v-else class="empty-hint">还没有选中任务。可以先新建一个测试任务。</p>

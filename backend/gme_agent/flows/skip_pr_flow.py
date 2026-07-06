@@ -36,7 +36,8 @@ def run_skip_pr_job(ctx, job_id: str) -> None:
         if not failures:
             raise RuntimeError("No latest open failures were found for the selected job.")
 
-        commit_rel_paths = _generated_test_paths(job, failures, target_path)
+        manifest_tests = _job_generated_tests(job)
+        commit_rel_paths = _skip_pr_test_paths(job, failures, target_path, manifest_tests)
         allowed_files = [normalize_repo_path(f"{target_repo}/{path}") for path in commit_rel_paths]
         test_log = _read_text(artifact_dir / "gtest_output.txt")
         prompt = skip_known_failure_prompt(test_log, failures, target_repo, allowed_files)
@@ -51,7 +52,10 @@ def run_skip_pr_job(ctx, job_id: str) -> None:
 
         _format_generated_tests(worktree, target_path, commit_rel_paths, emit)
         full_generated_snapshots = _snapshot_generated_tests(target_path, commit_rel_paths)
-        _prune_generated_tests_to_failures(target_path, commit_rel_paths, failures, emit)
+        if manifest_tests:
+            _prune_manifest_tests_to_failures(target_path, commit_rel_paths, failures, manifest_tests, emit)
+        else:
+            _prune_generated_tests_to_failures(target_path, commit_rel_paths, failures, emit)
         _format_generated_tests(worktree, target_path, commit_rel_paths, emit)
         ctx._run_configure_and_build(job_id, worktree)
         gtest_filter = _failure_suite_filter(failures)
@@ -116,6 +120,17 @@ def _failure_timestamp(failure: dict[str, Any]) -> str:
     return str(failure.get("updated_at") or failure.get("created_at") or "")
 
 
+def _skip_pr_test_paths(
+    job: dict[str, Any],
+    failures: list[dict[str, Any]],
+    target_path: Path,
+    manifest_tests: list[dict[str, str]] | None = None,
+) -> list[str]:
+    if manifest_tests:
+        return _manifest_test_paths_for_failures(failures, target_path, manifest_tests)
+    return _generated_test_paths(job, failures, target_path)
+
+
 def _generated_test_paths(job: dict[str, Any], failures: list[dict[str, Any]], target_path: Path) -> list[str]:
     result: list[str] = []
     seen: set[str] = set()
@@ -154,6 +169,57 @@ def _generated_test_path_for_module(module: str) -> str:
 def _is_generated_test_file(path: str) -> bool:
     name = Path(path).name
     return name.startswith("gme_agent_") and name.endswith("_generated_test.cpp")
+
+
+def _job_generated_tests(job: dict[str, Any]) -> list[dict[str, str]]:
+    tests = (job.get("metadata") or {}).get("generated_tests") or []
+    result: list[dict[str, str]] = []
+    for item in tests:
+        if not isinstance(item, dict):
+            continue
+        file_path = normalize_repo_path(str(item.get("file") or ""))
+        suite = str(item.get("suite") or "").strip()
+        name = str(item.get("name") or "").strip()
+        if file_path and suite and name:
+            result.append({"file": file_path, "suite": suite, "name": name})
+    return result
+
+
+def _manifest_test_paths_for_failures(
+    failures: list[dict[str, Any]],
+    target_path: Path,
+    manifest_tests: list[dict[str, str]],
+) -> list[str]:
+    manifest_by_key = {(item["suite"], item["name"]): item for item in manifest_tests}
+    missing: list[str] = []
+    paths: list[str] = []
+    seen: set[str] = set()
+    for failure in failures:
+        key = (str(failure.get("test_suite") or ""), str(failure.get("test_name") or ""))
+        item = manifest_by_key.get(key)
+        if item is None:
+            missing.append(f"{key[0]}.{key[1]}")
+            continue
+        rel_path = item["file"] or _failure_rel_path(target_path, failure)
+        if not rel_path:
+            missing.append(f"{key[0]}.{key[1]}")
+            continue
+        if rel_path not in seen:
+            seen.add(rel_path)
+            paths.append(rel_path)
+    if missing:
+        raise RuntimeError("Only tests listed in .gme-agent/generated_tests.json can be skipped: " + ", ".join(missing))
+    return paths
+
+
+def _failure_rel_path(target_path: Path, failure: dict[str, Any]) -> str:
+    path_value = str(failure.get("file") or "")
+    if not path_value:
+        return ""
+    try:
+        return normalize_repo_path(Path(path_value).resolve().relative_to(target_path.resolve()))
+    except ValueError:
+        return ""
 
 
 def _skip_pr_branch_name(job: dict[str, Any]) -> str:
@@ -245,6 +311,31 @@ def _prune_generated_tests_to_failures(target_path: Path, rel_paths: list[str], 
         emit("info", f"Pruned {rel_path} to {len(keep_tests)} skipped failure test(s).")
 
 
+def _prune_manifest_tests_to_failures(
+    target_path: Path,
+    rel_paths: list[str],
+    failures: list[dict[str, Any]],
+    manifest_tests: list[dict[str, str]],
+    emit,
+) -> None:
+    keep_tests = {(str(failure.get("test_suite") or ""), str(failure.get("test_name") or "")) for failure in failures}
+    manifest_by_path: dict[str, set[tuple[str, str]]] = {}
+    for item in manifest_tests:
+        manifest_by_path.setdefault(item["file"], set()).add((item["suite"], item["name"]))
+
+    for rel_path in rel_paths:
+        file_path = target_path / rel_path
+        if not file_path.exists():
+            raise RuntimeError(f"Generated test target file was not found: {rel_path}")
+        generated_in_file = manifest_by_path.get(rel_path, set())
+        remove_tests = generated_in_file - keep_tests
+        text = file_path.read_text(encoding="utf-8", errors="replace")
+        pruned = _remove_test_blocks(text, remove_tests, rel_path) if remove_tests else text
+        _require_skips_for_tests(pruned, generated_in_file & keep_tests, rel_path)
+        file_path.write_text(pruned, encoding="utf-8")
+        emit("info", f"Prepared {rel_path} with {len(generated_in_file & keep_tests)} skipped failure test(s).")
+
+
 def _failure_tests_by_generated_path(
     target_path: Path,
     rel_paths: list[str],
@@ -277,6 +368,45 @@ def _failure_tests_by_generated_path(
             names = ", ".join(f"{suite}.{name}" for suite, name in unresolved)
             raise RuntimeError(f"Could not map failures to generated test files: {names}")
     return result
+
+
+def _remove_test_blocks(text: str, remove_tests: set[tuple[str, str]], rel_path: str) -> str:
+    if not remove_tests:
+        return text
+    blocks = _test_blocks(text, rel_path)
+    chunks: list[str] = []
+    last = 0
+    removed: set[tuple[str, str]] = set()
+    for start, end, suite, test_name in blocks:
+        key = (suite, test_name)
+        if key in remove_tests:
+            chunks.append(text[last:start])
+            last = end
+            removed.add(key)
+    chunks.append(text[last:])
+    missing = remove_tests - removed
+    if missing:
+        names = ", ".join(f"{suite}.{name}" for suite, name in sorted(missing))
+        raise RuntimeError(f"Could not find generated passing tests to remove from {rel_path}: {names}")
+    return "".join(chunks)
+
+
+def _require_skips_for_tests(text: str, keep_tests: set[tuple[str, str]], rel_path: str) -> None:
+    if not keep_tests:
+        return
+    found: set[tuple[str, str]] = set()
+    for start, end, suite, test_name in _test_blocks(text, rel_path):
+        key = (suite, test_name)
+        if key not in keep_tests:
+            continue
+        block_text = text[start:end]
+        if "GTEST_SKIP" not in block_text:
+            raise RuntimeError(f"Failure test {suite}.{test_name} in {rel_path} does not contain GTEST_SKIP().")
+        found.add(key)
+    missing = keep_tests - found
+    if missing:
+        names = ", ".join(f"{suite}.{name}" for suite, name in sorted(missing))
+        raise RuntimeError(f"Could not find failure tests in {rel_path}: {names}")
 
 
 _TEST_DECL_RE = re.compile(
@@ -391,14 +521,16 @@ def _matching_brace(text: str, start: int) -> int:
 
 
 def _failure_suite_filter(failures: list[dict[str, Any]]) -> str:
-    suites = []
-    seen: set[str] = set()
+    tests = []
+    seen: set[tuple[str, str]] = set()
     for failure in failures:
         suite = str(failure.get("test_suite") or "")
-        if suite and suite not in seen:
-            seen.add(suite)
-            suites.append(f"{suite}.*")
-    return ":".join(suites) or "*"
+        name = str(failure.get("test_name") or "")
+        key = (suite, name)
+        if suite and name and key not in seen:
+            seen.add(key)
+            tests.append(f"{suite}.{name}")
+    return ":".join(tests) or "*"
 
 
 def _skip_pr_title(job: dict[str, Any]) -> str:

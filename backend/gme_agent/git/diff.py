@@ -9,6 +9,9 @@ from ..settings.config import AgentConfig
 from .worktree import EventCallback, is_git_repo, normalize_repo_path, run_git
 
 
+IGNORED_WORKTREE_ARTIFACT_PATTERNS = ("timer_res",)
+
+
 def ensure_only_target_repo_changed(
     worktree: str | Path,
     target_rel_path: str,
@@ -27,6 +30,8 @@ def ensure_only_target_repo_changed(
         if not path:
             continue
         norm = normalize_repo_path(path)
+        if _is_ignored_worktree_artifact(norm):
+            continue
         if target_rel != "." and (norm == target_rel or norm.startswith(f"{target_rel}/")):
             continue
         support_path = _matching_support_path(norm, support_paths)
@@ -158,3 +163,11 @@ def _matching_support_path(path: str, support_paths: set[str]) -> str:
         if path == support_path or path.startswith(f"{support_path}/"):
             return support_path
     return ""
+
+
+def _is_ignored_worktree_artifact(path: str) -> bool:
+    norm = normalize_repo_path(path)
+    if "/" in norm or norm == ".":
+        return False
+    name = Path(norm).name
+    return name.endswith(".csv") and any(name.startswith(prefix) for prefix in IGNORED_WORKTREE_ARTIFACT_PATTERNS)

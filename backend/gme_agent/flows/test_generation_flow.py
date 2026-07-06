@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..codex.runner import CodexRunner
+from ..generated_tests import ensure_generated_tests_use_existing_files, generated_test_filter, require_generated_tests_manifest
 from ..git.diff import ensure_only_target_repo_changed
 from ..git.repositories import prepare_target_repo, prepare_worktree_dependencies
 from ..git.worktree import create_worktree
@@ -33,7 +34,12 @@ def run_test_generation_job(ctx, job_id: str, module: str, api_name: str, target
         )
 
         artifact_dir = ctx._artifact_dir(job_id)
-        prompt = test_generation_prompt(module, api_name, target.rel_path)
+        prompt = test_generation_prompt(
+            module,
+            api_name,
+            target.rel_path,
+            _build_validation_guidance(ctx, worktree.path, artifact_dir),
+        )
         (artifact_dir / "test_generation_prompt.md").write_text(prompt, encoding="utf-8")
         emit("info", f"Wrote prompt artifact: {artifact_dir / 'test_generation_prompt.md'}")
 
@@ -47,13 +53,17 @@ def run_test_generation_job(ctx, job_id: str, module: str, api_name: str, target
             emit("warn", "Codex execution is disabled; only prompt and worktree were generated.")
         allowed_paths = [*prepared_paths, AGENT_NOTES_PATH]
         ensure_only_target_repo_changed(worktree.path, target.rel_path, allowed_support_paths=allowed_paths)
+        generated_metadata = _generated_manifest_metadata(worktree.path, target.rel_path, require=ctx.config.codex_enabled)
+        if generated_metadata:
+            ctx.db.update_job(job_id, metadata=ctx._merge_metadata(job_id, generated_metadata))
 
         if ctx.config.auto_run_build:
             ctx._run_configure_and_build(job_id, worktree.path)
 
         if ctx.config.auto_run_tests:
-            test_output = ctx._run_tests(job_id, worktree.path, "*")
-            failures = ctx._record_failures(job_id, test_output, "*", artifact_dir=artifact_dir)
+            gtest_filter = generated_metadata.get("generated_gtest_filter") or "*"
+            test_output = ctx._run_tests(job_id, worktree.path, gtest_filter)
+            failures = ctx._record_failures(job_id, test_output, gtest_filter, artifact_dir=artifact_dir)
             if failures:
                 emit("warn", f"Recorded {len(failures)} failing tests.")
                 if ctx.config.auto_apply_skips:
@@ -83,7 +93,7 @@ def run_test_generation_job(ctx, job_id: str, module: str, api_name: str, target
                     emit("warn", "auto_apply_skips is disabled; review skip_prompt.md manually.")
 
         ctx._write_job_artifacts(job_id, worktree.path, artifact_dir)
-        ctx.db.update_job(job_id, status="needs_review", metadata=ctx._merge_metadata(job_id, {"artifact_dir": str(artifact_dir)}))
+        ctx.db.update_job(job_id, status="needs_review", metadata=ctx._merge_metadata(job_id, {"artifact_dir": str(artifact_dir), **generated_metadata}))
         emit("info", "Job finished and is ready for review.")
         if ctx.config.auto_create_pr:
             ctx._run_pr_job(job_id)
@@ -107,7 +117,12 @@ def run_test_extension_job(ctx, job_id: str, api_name: str) -> None:
         module = str(job.get("module") or "")
         target_repo = ctx._job_target_repo(job)
         artifact_dir = ctx._artifact_dir(job_id)
-        prompt = continue_test_generation_prompt(module, api_name or str(job.get("api_name") or ""), target_repo)
+        prompt = continue_test_generation_prompt(
+            module,
+            api_name or str(job.get("api_name") or ""),
+            target_repo,
+            _build_validation_guidance(ctx, worktree, artifact_dir),
+        )
         prompt_path = artifact_dir / "test_generation_extend_prompt.md"
         prompt_path.write_text(prompt, encoding="utf-8")
         emit("info", f"Wrote extension prompt artifact: {prompt_path}")
@@ -129,17 +144,57 @@ def run_test_extension_job(ctx, job_id: str, api_name: str) -> None:
         if AGENT_NOTES_PATH not in allowed_paths:
             allowed_paths.append(AGENT_NOTES_PATH)
         ensure_only_target_repo_changed(worktree, target_repo, allowed_support_paths=allowed_paths)
+        generated_metadata = _generated_manifest_metadata(worktree, target_repo, require=ctx.config.codex_enabled)
+        if generated_metadata:
+            ctx.db.update_job(job_id, metadata=ctx._merge_metadata(job_id, generated_metadata))
 
         if ctx.config.auto_run_build:
             ctx._run_configure_and_build(job_id, worktree)
 
         if ctx.config.auto_run_tests:
-            test_output = ctx._run_tests(job_id, worktree, "*")
-            ctx._record_failures(job_id, test_output, "*", artifact_dir=artifact_dir)
+            gtest_filter = generated_metadata.get("generated_gtest_filter") or "*"
+            test_output = ctx._run_tests(job_id, worktree, gtest_filter)
+            ctx._record_failures(job_id, test_output, gtest_filter, artifact_dir=artifact_dir)
 
         ctx._write_job_artifacts(job_id, worktree, artifact_dir)
-        ctx.db.update_job(job_id, status="needs_review", metadata=ctx._merge_metadata(job_id, {"artifact_dir": str(artifact_dir)}))
+        ctx.db.update_job(job_id, status="needs_review", metadata=ctx._merge_metadata(job_id, {"artifact_dir": str(artifact_dir), **generated_metadata}))
         emit("info", "Test extension finished and is ready for review.")
     except Exception as exc:
         ctx.db.update_job(job_id, status="failed", error=str(exc))
         emit("error", str(exc))
+
+
+def _generated_manifest_metadata(worktree: Path, target_repo: str, *, require: bool) -> dict:
+    if not require:
+        return {}
+    manifest = require_generated_tests_manifest(worktree, target_repo)
+    ensure_generated_tests_use_existing_files(worktree, target_repo, manifest["files"])
+    return {
+        "generated_tests": manifest["tests"],
+        "generated_test_files": manifest["files"],
+        "generated_gtest_filter": generated_test_filter(manifest),
+    }
+
+
+def _build_validation_guidance(ctx, worktree: Path, artifact_dir: Path) -> str:
+    build_dir = worktree / "build" / "vscode"
+    generated_filter_placeholder = "<exact-generated-filter-from-.gme-agent/generated_tests.json>"
+    try:
+        mapping = ctx._command_mapping(worktree, build_dir, generated_filter_placeholder, artifact_dir=artifact_dir)
+        configure_command = ctx.config.configure_command.format(**mapping)
+        build_command = ctx.config.build_command.format(**mapping)
+        test_command = ctx.config.test_command.format(**mapping)
+    except Exception as exc:
+        return f"""Build validation commands:
+- The GME Test Agent could not pre-render configured build commands: {exc}
+- Use the Settings page command templates with these placeholders: `worktree`, `build_dir`, `test_module_name`, `develop_module_option`, `test_module_option`, `gtest_filter`, `test_executable`, `artifact_dir`, `gtest_xml_path`.
+- Build directory: `{build_dir}`"""
+    return f"""Build validation commands from the GME Test Agent settings:
+- Build directory: `{build_dir}`
+- Configure:
+  `{configure_command}`
+- Build:
+  `{build_command}`
+- Optional focused run after a successful build, after `.gme-agent/generated_tests.json` provides the exact filter:
+  `{test_command}`
+- These commands are authoritative for this task. If they fail because of generated test code, fix or delete the generated tests before the final response."""

@@ -1,4 +1,4 @@
-import { computed, reactive, ref } from "vue";
+import { computed, reactive, ref, watch } from "vue";
 import { api } from "../api";
 
 export const jobTypeLabels = {
@@ -31,7 +31,9 @@ export const failureStatusLabels = {
 };
 
 const activePage = ref("test");
-const activeJobTab = ref("logs");
+const activeJobTab = ref("results");
+const codeViewMode = ref("tests");
+const selectedCodeFile = ref("");
 const loading = ref(false);
 const busyAction = ref("");
 const error = ref("");
@@ -44,6 +46,7 @@ const events = ref([]);
 const artifacts = ref({ artifact_dir: "", files: [], contents: {} });
 const selectedJobId = ref("");
 const selectedFailureId = ref("");
+const selectedGeneratedTestKeys = ref([]);
 
 const configOptions = ref({
   branches: [],
@@ -86,7 +89,7 @@ const configForm = reactive({
 const testForm = reactive({
   module: "laws",
   apiName: "",
-  gtestFilter: "*",
+  gtestFilter: "",
 });
 
 function failureTimestamp(failure) {
@@ -116,6 +119,7 @@ const selectedJobFailures = computed(() => currentFailures.value.filter((failure
 const selectedJobOpenFailures = computed(() => selectedJobFailures.value.filter((failure) => failure.status === "open"));
 const eventsText = computed(() => events.value.map((event) => `[${event.ts}] ${event.level}: ${event.message}`).join("\n"));
 const diffText = computed(() => artifacts.value.contents?.["diff.patch"] || "");
+const latestGtestOutput = computed(() => artifacts.value.contents?.["gtest_output_after_skip.txt"] || artifacts.value.contents?.["gtest_output.txt"] || "");
 const codexText = computed(
   () => artifacts.value.contents?.["codex_skip_result.txt"] || artifacts.value.contents?.["codex_extend_result.txt"] || artifacts.value.contents?.["codex_result.txt"] || "",
 );
@@ -142,20 +146,119 @@ const jobDetailJson = computed(() =>
 const failureDetailJson = computed(() => JSON.stringify({ failure: selectedFailure.value }, null, 2));
 const selectedJobModule = computed(() => selectedJob.value?.module || testForm.module || "");
 const generatedTestInfo = computed(() => {
+  const metadata = selectedJob.value?.metadata || {};
+  const files = Array.isArray(metadata.generated_test_files) ? metadata.generated_test_files : [];
+  const tests = Array.isArray(metadata.generated_tests) ? metadata.generated_tests : [];
+  const filter = metadata.generated_gtest_filter || tests.map((test) => `${test.suite}.${test.name}`).join(":");
+  const suites = [...new Set(tests.map((test) => test.suite).filter(Boolean))];
+  const fileCount = files.length || new Set(tests.map((test) => test.file).filter(Boolean)).size;
+  const testCount = tests.length || (filter && filter !== "*" ? filter.split(":").filter(Boolean).length : 0);
+  const summaryParts = [];
+  if (testCount) summaryParts.push(`${testCount} 条测试`);
+  if (fileCount) summaryParts.push(`${fileCount} 个文件`);
+  if (suites.length) summaryParts.push(`${suites.length} 个 suite`);
+  const filterSummary = summaryParts.join(" · ") || "全部测试";
+  if (files.length || tests.length || filter) {
+    return {
+      file: files.length ? files.map((file) => `tests/gme/${file}`).join(", ") : "tests/gme/src/<module>/<existing_test>.cpp",
+      files,
+      tests,
+      filter: filter || "*",
+      suite: suites.join(", "),
+      testCount,
+      fileCount,
+      suiteCount: suites.length,
+      filterSummary,
+    };
+  }
   const moduleName = String(selectedJobModule.value || "module").replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
-  const moduleToken = moduleName.split("/").filter(Boolean).join("_") || "module";
-  const modulePrefix = moduleToken
-    .split("_")
-    .filter(Boolean)
-    .map((part) => `${part.slice(0, 1).toUpperCase()}${part.slice(1)}`)
-    .join("");
-  const suite = `${modulePrefix}_GmeAgentGeneratedTest`;
   return {
-    file: `tests/gme/src/${moduleName}/gme_agent_${moduleToken}_generated_test.cpp`,
-    filter: `${suite}.*`,
-    suite,
+    file: `tests/gme/src/${moduleName}/<existing_test>.cpp`,
+    files: [],
+    tests: [],
+    filter: "*",
+    suite: "",
+    testCount: 0,
+    fileCount: 0,
+    suiteCount: 0,
+    filterSummary: "全部测试",
   };
 });
+const generatedTestRows = computed(() => {
+  const tests = generatedTestInfo.value.tests || [];
+  const failuresByKey = new Map(selectedJobFailures.value.map((failure) => [`${failure.test_suite}.${failure.test_name}`, failure]));
+  return tests.map((test, index) => {
+    const fullName = `${test.suite}.${test.name}`;
+    const failure = failuresByKey.get(fullName) || null;
+    const status = generatedTestStatus(fullName, failure, latestGtestOutput.value);
+    return {
+      index: index + 1,
+      file: normalizePath(test.file || ""),
+      suite: test.suite || "",
+      name: test.name || "",
+      fullName,
+      api: test.api || "",
+      anchor: test.anchor || "",
+      line: failure?.line || "",
+      reason: failure?.reason || "",
+      status,
+      statusLabel: generatedTestStatusLabel(status),
+      failure,
+    };
+  });
+});
+const selectedGeneratedTestRows = computed(() => {
+  const selected = new Set(selectedGeneratedTestKeys.value);
+  return generatedTestRows.value.filter((row) => selected.has(row.fullName));
+});
+const selectedGeneratedTestCount = computed(() => selectedGeneratedTestRows.value.length);
+const testResultSummary = computed(() => {
+  const rows = generatedTestRows.value;
+  const fileCount = generatedTestInfo.value.files?.length || new Set(rows.map((row) => row.file).filter(Boolean)).size;
+  return {
+    files: fileCount,
+    total: rows.length,
+    passed: rows.filter((row) => row.status === "passed").length,
+    failed: rows.filter((row) => row.status === "failed").length,
+    skipped: rows.filter((row) => row.status === "skipped").length,
+    unknown: rows.filter((row) => row.status === "unknown").length,
+    hasOutput: Boolean(latestGtestOutput.value),
+  };
+});
+const diffFiles = computed(() => parseDiffFiles(diffText.value));
+const codeChangeFiles = computed(() => {
+  const testsByFile = new Map();
+  for (const row of generatedTestRows.value) {
+    const key = normalizePath(row.file);
+    if (!key) continue;
+    if (!testsByFile.has(key)) testsByFile.set(key, []);
+    testsByFile.get(key).push(row);
+  }
+  const filesByPath = new Map(diffFiles.value.map((file) => [normalizePath(file.path), file]));
+  for (const file of generatedTestInfo.value.files || []) {
+    const key = normalizePath(file);
+    if (!filesByPath.has(key)) filesByPath.set(key, { path: key, additions: 0, deletions: 0, raw: "", addedText: "" });
+  }
+  return Array.from(filesByPath.values())
+    .map((file) => {
+      const path = normalizePath(file.path);
+      const tests = testsByFile.get(path) || [];
+      const blocks = tests.map((test) => ({
+        ...test,
+        code: extractAddedTestBlock(file.addedText || "", test.suite, test.name),
+      }));
+      return {
+        ...file,
+        path,
+        tests,
+        blocks,
+        failedCount: tests.filter((test) => test.status === "failed").length,
+      };
+    })
+    .filter((file) => file.path)
+    .sort((left, right) => left.path.localeCompare(right.path));
+});
+const selectedCodeChangeFile = computed(() => codeChangeFiles.value.find((file) => file.path === selectedCodeFile.value) || codeChangeFiles.value[0] || null);
 const workflowSteps = computed(() => {
   const job = selectedJob.value;
   const fileNames = new Set((artifacts.value.files || []).map((file) => file.name));
@@ -177,7 +280,7 @@ const workflowSteps = computed(() => {
     },
     {
       label: "GTest 运行",
-      detail: testForm.gtestFilter || generatedTestInfo.value.filter,
+      detail: testForm.gtestFilter ? "使用手动过滤器" : generatedTestInfo.value.filterSummary,
       state: stepState(job, "running_tests", fileNames.has("gtest_output.txt")),
     },
     {
@@ -222,10 +325,39 @@ const approvalPolicyOptions = computed(() => withCurrent(configOptions.value.app
 
 let noticeTimer = null;
 
+watch(
+  codeChangeFiles,
+  (files) => {
+    if (!files.length) {
+      selectedCodeFile.value = "";
+      return;
+    }
+    if (!files.some((file) => file.path === selectedCodeFile.value)) {
+      selectedCodeFile.value = files[0].path;
+    }
+  },
+  { immediate: true },
+);
+
+watch(
+  generatedTestRows,
+  (rows) => {
+    const valid = new Set(rows.map((row) => row.fullName));
+    selectedGeneratedTestKeys.value = selectedGeneratedTestKeys.value.filter((key) => valid.has(key));
+  },
+  { immediate: true },
+);
+
+watch(selectedJobId, () => {
+  selectedGeneratedTestKeys.value = [];
+});
+
 export function useWorkspace() {
   return {
     activePage,
     activeJobTab,
+    codeViewMode,
+    selectedCodeFile,
     loading,
     busyAction,
     error,
@@ -248,11 +380,19 @@ export function useWorkspace() {
     selectedJobOpenFailures,
     eventsText,
     diffText,
+    latestGtestOutput,
     codexText,
     agentNotesText,
     jobDetailJson,
     failureDetailJson,
     generatedTestInfo,
+    generatedTestRows,
+    selectedGeneratedTestKeys,
+    selectedGeneratedTestRows,
+    selectedGeneratedTestCount,
+    testResultSummary,
+    codeChangeFiles,
+    selectedCodeChangeFile,
     workflowSteps,
     jobStats,
     failureStats,
@@ -275,6 +415,7 @@ export function useWorkspace() {
     buildSelectedJob,
     runSelectedTests,
     createSkipPrForSelectedJob,
+    deleteSelectedGeneratedTests,
     cleanupSelectedJob,
     deleteSelectedJob,
     fixSelectedFailure,
@@ -426,7 +567,7 @@ async function buildSelectedJob() {
 async function runSelectedTests() {
   await withSelectedJob("运行选中测试", (job) =>
     api.runTests(job.id, {
-      gtest_filter: testForm.gtestFilter || "*",
+      gtest_filter: testForm.gtestFilter || generatedTestInfo.value.filter || "*",
     }),
   );
 }
@@ -437,6 +578,32 @@ async function createSkipPrForSelectedJob() {
       throw new Error("当前任务没有最新未处理失败用例。");
     }
     return api.createSkipPr(job.id);
+  });
+}
+
+async function deleteSelectedGeneratedTests() {
+  const job = selectedJob.value;
+  if (!job) {
+    setError("请先选择一个任务。");
+    return;
+  }
+  if (job.type !== "test_generation") {
+    setError("只能删除测试生成任务中的生成测试。");
+    return;
+  }
+  const rows = selectedGeneratedTestRows.value;
+  if (!rows.length) {
+    setError("请先选择要删除的生成测试。");
+    return;
+  }
+  const names = rows.map((row) => row.fullName).join("\n");
+  if (!window.confirm(`确定要删除选中的 ${rows.length} 个生成测试吗？\n\n${names}`)) return;
+  await runAction("删除选中测试", async () => {
+    await api.deleteGeneratedTests(
+      job.id,
+      rows.map((row) => ({ suite: row.suite, name: row.name })),
+    );
+    selectedGeneratedTestKeys.value = [];
   });
 }
 
@@ -524,6 +691,132 @@ async function runAction(label, action) {
 
 function failureFilter(failure) {
   return failure?.test_suite && failure?.test_name ? `${failure.test_suite}.${failure.test_name}` : "*";
+}
+
+function normalizePath(path) {
+  return String(path || "")
+    .replace(/\\/g, "/")
+    .replace(/^tests\/gme\//, "")
+    .replace(/^\/+/, "");
+}
+
+function generatedTestStatus(fullName, failure, output) {
+  if (failure?.status === "open") return "failed";
+  if (hasGtestLine(output, "FAILED", fullName)) return "failed";
+  if (hasGtestLine(output, "OK", fullName)) return "passed";
+  if (hasGtestLine(output, "SKIPPED", fullName)) return "skipped";
+  return output ? "unknown" : "unknown";
+}
+
+function generatedTestStatusLabel(status) {
+  return {
+    passed: "通过",
+    failed: "失败",
+    skipped: "已跳过",
+    unknown: "未确认",
+  }[status] || status;
+}
+
+function hasGtestLine(output, status, fullName) {
+  if (!output || !fullName) return false;
+  const escaped = escapeRegExp(fullName);
+  return new RegExp(`\\[\\s*${status}\\s*\\]\\s+${escaped}(?:\\s|$)`).test(output);
+}
+
+function parseDiffFiles(diff) {
+  const files = [];
+  let current = null;
+  for (const line of String(diff || "").split(/\r?\n/)) {
+    const fileMatch = /^diff --git a\/(.+?) b\/(.+)$/.exec(line);
+    if (fileMatch) {
+      current = {
+        path: normalizePath(fileMatch[2]),
+        additions: 0,
+        deletions: 0,
+        rawLines: [line],
+        addedLines: [],
+      };
+      files.push(current);
+      continue;
+    }
+    if (!current) continue;
+    current.rawLines.push(line);
+    if (line.startsWith("+") && !line.startsWith("+++")) {
+      current.additions += 1;
+      current.addedLines.push(line.slice(1));
+    } else if (line.startsWith("-") && !line.startsWith("---")) {
+      current.deletions += 1;
+    }
+  }
+  return files.map((file) => ({
+    path: file.path,
+    additions: file.additions,
+    deletions: file.deletions,
+    raw: file.rawLines.join("\n"),
+    addedText: file.addedLines.join("\n"),
+  }));
+}
+
+function extractAddedTestBlock(text, suite, name) {
+  if (!text || !suite || !name) return "";
+  const decl = new RegExp(`TEST_F\\s*\\(\\s*${escapeRegExp(suite)}\\s*,\\s*${escapeRegExp(name)}\\s*\\)\\s*\\{`);
+  const match = decl.exec(text);
+  if (!match) return "";
+  const brace = text.indexOf("{", match.index);
+  const end = matchingBrace(text, brace);
+  if (end < 0) return text.slice(match.index).trim();
+  let start = match.index;
+  const before = text.slice(0, start);
+  const previousTest = Math.max(before.lastIndexOf("TEST_F("), before.lastIndexOf("TEST("));
+  const commentStart = Math.max(before.lastIndexOf("/**"), before.lastIndexOf("/*"));
+  if (commentStart > previousTest) start = commentStart;
+  return text.slice(start, end + 1).trim();
+}
+
+function matchingBrace(text, start) {
+  if (start < 0) return -1;
+  let depth = 0;
+  let state = "code";
+  for (let i = start; i < text.length; i += 1) {
+    const ch = text[i];
+    const next = text[i + 1] || "";
+    if (state === "code") {
+      if (ch === "/" && next === "/") {
+        state = "line";
+        i += 1;
+      } else if (ch === "/" && next === "*") {
+        state = "block";
+        i += 1;
+      } else if (ch === '"') {
+        state = "string";
+      } else if (ch === "'") {
+        state = "char";
+      } else if (ch === "{") {
+        depth += 1;
+      } else if (ch === "}") {
+        depth -= 1;
+        if (depth === 0) return i;
+      }
+    } else if (state === "line") {
+      if (ch === "\n") state = "code";
+    } else if (state === "block") {
+      if (ch === "*" && next === "/") {
+        state = "code";
+        i += 1;
+      }
+    } else if (state === "string") {
+      if (ch === "\\") i += 1;
+      else if (ch === '"') state = "code";
+    } else if (state === "char") {
+      if (ch === "\\") i += 1;
+      else if (ch === "'") state = "code";
+    }
+  }
+  return -1;
+}
+
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function withCurrent(values, current) {

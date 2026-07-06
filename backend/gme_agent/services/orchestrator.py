@@ -13,6 +13,7 @@ from ..flows.build_test_flow import (
     run_tests,
     run_tests_job,
 )
+from ..flows.generated_test_edit_flow import delete_generated_tests
 from ..flows.pr_flow import run_cleanup_job, run_pr_job
 from ..flows.skip_pr_flow import run_skip_pr_job
 from ..flows.test_generation_flow import run_test_extension_job, run_test_generation_job
@@ -101,6 +102,9 @@ class Orchestrator:
 
     def delete_job(self, job_id: str, *, cleanup_worktree: bool = True, delete_artifacts: bool = True) -> dict[str, Any]:
         return delete_job_record(self, job_id, cleanup_worktree=cleanup_worktree, delete_artifacts=delete_artifacts)
+
+    def delete_generated_tests_for_job(self, job_id: str, tests: list[dict[str, str]]) -> dict[str, Any]:
+        return delete_generated_tests(self, job_id, tests)
 
     def update_failure_status(self, failure_id: str, status: str) -> dict[str, Any]:
         return update_failure_status(self.db, failure_id, status)

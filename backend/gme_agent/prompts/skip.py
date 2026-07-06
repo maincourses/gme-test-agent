@@ -6,7 +6,7 @@ def skip_known_failure_prompt(test_log: str, failures: list[dict], target_repo: 
         f"- id={f.get('id')} test={f.get('test_suite')}.{f.get('test_name')} file={f.get('file')} line={f.get('line')} reason={f.get('reason')}"
         for f in failures
     )
-    allowed_file_lines = "\n".join(f"- `{path}`" for path in (allowed_files or [])) or f"- generated test files under `{target_repo}`"
+    allowed_file_lines = "\n".join(f"- `{path}`" for path in (allowed_files or [])) or f"- files listed in `.gme-agent/generated_tests.json`"
     return f"""The newly generated GME-vs-ACIS tests produced failures.
 
 Task:
@@ -20,7 +20,8 @@ Task:
 - Do not hide compile errors, test framework errors, or invalid-test-input problems.
 - Keep the failure reason and reproduction command visible in comments or skip text.
 - Do not change GME source code, test assertions, fixtures, or non-listed tests.
-- The final skip PR should contain only the listed failing generated tests plus compile-required includes/fixtures/helpers.
+- Do not add new helper functions, helper classes, helper headers, macros, or shared utilities.
+- The final skip PR should contain only the listed failing generated tests inserted in their existing test files. Do not include generated passing tests.
 
 Allowed files:
 {allowed_file_lines}

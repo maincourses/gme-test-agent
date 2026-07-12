@@ -1,0 +1,3 @@
+1.skills目录下的skill的完善
+2.测试agent使用中遇到的问题反馈
+3.测试agent和修复agent的相关bug解决

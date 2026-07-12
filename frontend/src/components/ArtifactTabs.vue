@@ -5,6 +5,7 @@ import { useWorkspace } from "../composables/useWorkspace";
 
 const {
   activeJobTab,
+  busyAction,
   codeViewMode,
   selectedCodeFile,
   selectedJob,
@@ -13,12 +14,15 @@ const {
   diffText,
   codexText,
   generatedTestRows,
+  submittedTestRows,
   selectedGeneratedTestKeys,
   selectedGeneratedTestCount,
   testResultSummary,
   codeChangeFiles,
   selectedCodeChangeFile,
   openPr,
+  openPrUrl,
+  createSelectedTestsPr,
   deleteSelectedGeneratedTests,
 } = useWorkspace();
 
@@ -45,7 +49,7 @@ const debugSelectValue = computed(() => (debugTabValues.has(activeJobTab.value) 
 
       <button class="tab-action" type="button" @click="openPr">
         <GitPullRequest :size="15" />
-        打开 PR
+        打开最新 PR
       </button>
     </div>
 
@@ -68,6 +72,10 @@ const debugSelectValue = computed(() => (debugTabValues.has(activeJobTab.value) 
           <strong>{{ testResultSummary.failed }}</strong>
         </div>
         <div>
+          <span>已提 PR</span>
+          <strong>{{ testResultSummary.submitted }}</strong>
+        </div>
+        <div>
           <span>未确认</span>
           <strong>{{ testResultSummary.unknown }}</strong>
         </div>
@@ -75,13 +83,19 @@ const debugSelectValue = computed(() => (debugTabValues.has(activeJobTab.value) 
 
       <div class="review-actions">
         <span>已选择 {{ selectedGeneratedTestCount }} 个生成测试</span>
-        <button class="danger-button compact" type="button" :disabled="!selectedGeneratedTestCount" @click="deleteSelectedGeneratedTests">
-          <Trash2 :size="14" />
-          删除选中测试
-        </button>
+        <div class="review-action-buttons">
+          <button class="success-button compact" type="button" :disabled="!!busyAction || selectedJob?.active || !selectedGeneratedTestCount" @click="createSelectedTestsPr">
+            <GitPullRequest :size="14" />
+            提交选中测试 PR
+          </button>
+          <button class="danger-button compact" type="button" :disabled="!!busyAction || selectedJob?.active || !selectedGeneratedTestCount" @click="deleteSelectedGeneratedTests">
+            <Trash2 :size="14" />
+            删除选中测试
+          </button>
+        </div>
       </div>
 
-      <div class="review-table-wrap">
+      <div class="review-table-wrap result-table-scroll">
         <table class="review-table">
           <thead>
             <tr>
@@ -110,6 +124,44 @@ const debugSelectValue = computed(() => (debugTabValues.has(activeJobTab.value) 
           </tbody>
         </table>
       </div>
+
+      <section v-if="submittedTestRows.length" class="submitted-tests-section">
+        <div class="submitted-tests-heading">
+          <div>
+            <h3>已提交 PR 测试</h3>
+            <span>这些测试仍保留在当前任务中，但不会重复进入新的 PR。</span>
+          </div>
+          <span class="mini-badge">{{ submittedTestRows.length }} 个</span>
+        </div>
+
+        <div class="review-table-wrap submitted-table-scroll">
+          <table class="review-table">
+            <thead>
+              <tr>
+                <th>结果</th>
+                <th>测试</th>
+                <th>API</th>
+                <th>文件</th>
+                <th>PR</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="test in submittedTestRows" :key="`submitted-${test.fullName}`">
+                <td><span class="status-pill" :class="test.status">{{ test.statusLabel }}</span></td>
+                <td><code>{{ test.fullName }}</code></td>
+                <td>{{ test.api || "-" }}</td>
+                <td class="truncate">{{ test.file }}</td>
+                <td>
+                  <button class="ghost-button compact" type="button" :disabled="!test.prUrl" @click="openPrUrl(test.prUrl)">
+                    <GitPullRequest :size="14" />
+                    {{ test.prLabel }}
+                  </button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
     </div>
 
     <div v-else-if="activeJobTab === 'changes'" class="review-content code-review">
@@ -167,12 +219,19 @@ const debugSelectValue = computed(() => (debugTabValues.has(activeJobTab.value) 
     <div v-else-if="activeJobTab === 'failures'" class="review-content">
       <div class="review-actions">
         <span>已选择 {{ selectedGeneratedTestCount }} 个生成测试</span>
-        <button class="danger-button compact" type="button" :disabled="!selectedGeneratedTestCount" @click="deleteSelectedGeneratedTests">
-          <Trash2 :size="14" />
-          删除选中测试
-        </button>
+        <div class="review-action-buttons">
+          <button class="success-button compact" type="button" :disabled="!!busyAction || selectedJob?.active || !selectedGeneratedTestCount" @click="createSelectedTestsPr">
+            <GitPullRequest :size="14" />
+            提交选中测试 PR
+          </button>
+          <button class="danger-button compact" type="button" :disabled="!!busyAction || selectedJob?.active || !selectedGeneratedTestCount" @click="deleteSelectedGeneratedTests">
+            <Trash2 :size="14" />
+            删除选中测试
+          </button>
+        </div>
       </div>
-      <div class="review-table-wrap">
+
+      <div class="review-table-wrap result-table-scroll">
         <table class="review-table">
           <thead>
             <tr>

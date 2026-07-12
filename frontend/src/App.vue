@@ -1,12 +1,14 @@
 <script setup>
 import { onBeforeUnmount, onMounted } from "vue";
-import { FlaskConical, RefreshCw, Settings2, ShieldCheck } from "@lucide/vue";
+import { FlaskConical, RefreshCw, Settings2, ShieldCheck, Wrench } from "@lucide/vue";
 import ConfigPage from "./pages/ConfigPage.vue";
+import FixAgentPage from "./pages/FixAgentPage.vue";
 import TestAgentPage from "./pages/TestAgentPage.vue";
 import { useWorkspace } from "./composables/useWorkspace";
 
 const navItems = [
   { id: "test", label: "测试 Agent", detail: "生成、构建、运行测试", icon: FlaskConical },
+  { id: "fix", label: "修复 Agent", detail: "复现、修源码、验证测试", icon: Wrench },
   { id: "config", label: "设置", detail: "环境、路径、模型", icon: Settings2 },
 ];
 
@@ -68,7 +70,7 @@ onBeforeUnmount(() => {
 
       <div class="side-metrics">
         <div>
-          <span>任务</span>
+          <span>测试</span>
           <strong>{{ jobStats.total }}</strong>
         </div>
         <div>
@@ -103,6 +105,7 @@ onBeforeUnmount(() => {
       <div v-if="notice" class="alert success">{{ notice }}</div>
 
       <ConfigPage v-show="activePage === 'config'" />
+      <FixAgentPage v-show="activePage === 'fix'" />
       <TestAgentPage v-show="activePage === 'test'" />
     </main>
 

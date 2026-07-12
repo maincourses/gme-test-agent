@@ -6,13 +6,39 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 from dataclasses import asdict
+import hmac
 import json
 
-from ..services.orchestrator import Orchestrator
+from ..services.orchestrator import JobAlreadyActiveError, Orchestrator
+from ..services.interface_catalog_service import (
+    list_selectable_interface_catalogs,
+    selectable_interface_catalog,
+)
 from ..settings.config import AgentConfig, config_from_json, load_config, save_config
 from ..settings.options import load_config_options
 from ..settings.validation import validate_config
 from ..storage.db import AgentDb
+
+
+MIN_API_TOKEN_LENGTH = 32
+LOOPBACK_ORIGIN_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def api_token_matches(expected: str, authorization: str) -> bool:
+    scheme, separator, supplied = str(authorization or "").partition(" ")
+    if not separator or scheme.lower() != "bearer" or not supplied:
+        return False
+    return hmac.compare_digest(str(expected), supplied.strip())
+
+
+def is_allowed_origin(origin: str) -> bool:
+    value = str(origin or "").strip()
+    if not value:
+        return True
+    if value == "null":
+        return True
+    parsed = urlparse(value)
+    return parsed.scheme == "http" and parsed.hostname in LOOPBACK_ORIGIN_HOSTS
 
 
 class ServerState:
@@ -30,41 +56,73 @@ class ServerState:
         return self.config
 
 
-def run_server(config_path: Path, host: str, port: int) -> None:
+def create_server(config_path: Path, host: str, port: int, api_token: str) -> ThreadingHTTPServer:
+    if len(str(api_token or "")) < MIN_API_TOKEN_LENGTH:
+        raise RuntimeError(f"GME_AGENT_API_TOKEN must contain at least {MIN_API_TOKEN_LENGTH} characters.")
     state = ServerState(config_path)
 
     class Handler(ApiHandler):
-        server_state = state
+        pass
 
+    Handler.server_state = state
+    Handler.api_token = api_token
     httpd = ThreadingHTTPServer((host, port), Handler)
+    httpd.agent_state = state  # type: ignore[attr-defined]
+    return httpd
+
+
+def run_server(config_path: Path, host: str, port: int, api_token: str) -> None:
+    httpd = create_server(config_path, host, port, api_token)
+
     print(f"GME Test Agent backend listening on http://{host}:{port}")
     httpd.serve_forever()
 
 
 class ApiHandler(BaseHTTPRequestHandler):
     server_state: ServerState
+    api_token: str
 
     def do_OPTIONS(self) -> None:
+        if not self._origin_is_allowed():
+            self._send_error(HTTPStatus.FORBIDDEN, "Browser origin is not allowed.")
+            return
         self._send_json({"ok": True})
 
     def do_GET(self) -> None:
+        if not self._authorize():
+            return
         try:
             path, query = self._path()
             if path == "/api/health":
-                self._send_json({"ok": True})
+                self._send_json({"ok": True, "authenticated": True})
             elif path == "/api/config":
                 self._send_json(asdict(self.server_state.config))
             elif path == "/api/validate":
                 self._send_json(validate_config(self.server_state.config))
             elif path == "/api/options":
                 self._send_json(load_config_options(self.server_state.config))
+            elif path == "/api/interface-catalogs":
+                self._send_json(list_selectable_interface_catalogs())
+            elif path.startswith("/api/interface-catalogs/"):
+                module = path.split("/")[3]
+                self._send_json(selectable_interface_catalog(module))
             elif path == "/api/jobs":
-                self._send_json({"jobs": self.server_state.db.list_jobs()})
+                self._send_json({"jobs": self.server_state.orchestrator.list_jobs_with_runtime_state()})
             elif path == "/api/failures":
                 self._send_json({"failures": self.server_state.db.list_failures()})
+            elif path.startswith("/api/failures/") and path.endswith("/observations"):
+                failure_id = path.split("/")[3]
+                self._send_json(
+                    {"observations": self.server_state.db.list_failure_observations(failure_id)}
+                )
             elif path.startswith("/api/failures/"):
                 failure_id = path.split("/")[3]
                 self._send_json(self.server_state.db.get_failure(failure_id))
+            elif path.startswith("/api/jobs/") and path.endswith("/test-results"):
+                job_id = path.split("/")[3]
+                self._send_json(
+                    {"results": self.server_state.db.list_test_case_results(job_id)}
+                )
             elif path.startswith("/api/jobs/") and path.endswith("/events"):
                 job_id = path.split("/")[3]
                 after = int(query.get("after", ["0"])[0])
@@ -74,13 +132,17 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._send_json(self._job_artifacts(job_id))
             elif path.startswith("/api/jobs/"):
                 job_id = path.split("/")[3]
-                self._send_json(self.server_state.db.get_job(job_id))
+                self._send_json(self.server_state.orchestrator.job_with_runtime_state(job_id))
             else:
                 self._send_error(HTTPStatus.NOT_FOUND, f"Unknown endpoint: {path}")
+        except JobAlreadyActiveError as exc:
+            self._send_error(HTTPStatus.CONFLICT, str(exc))
         except Exception as exc:
             self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
 
     def do_POST(self) -> None:
+        if not self._authorize():
+            return
         try:
             path, _ = self._path()
             data = self._read_json()
@@ -91,12 +153,18 @@ class ApiHandler(BaseHTTPRequestHandler):
                 job = self.server_state.orchestrator.create_test_generation_job(
                     module=str(data.get("module") or "gme"),
                     api_name=str(data.get("api_name") or ""),
+                    interface_ids=data.get("interface_ids"),
+                    tests_per_interface=data.get("tests_per_interface", 1),
+                    extra_requirements=str(data.get("extra_requirements") or ""),
                 )
                 self._send_json(job, HTTPStatus.ACCEPTED)
             elif job_id := _match_job_action(path, "extend-tests"):
                 job = self.server_state.orchestrator.extend_test_generation_job(
                     job_id,
                     api_name=str(data.get("api_name") or ""),
+                    interface_ids=data.get("interface_ids"),
+                    tests_per_interface=data.get("tests_per_interface", 1),
+                    extra_requirements=str(data.get("extra_requirements") or ""),
                 )
                 self._send_json(job, HTTPStatus.ACCEPTED)
             elif job_id := _match_job_action(path, "run-tests"):
@@ -113,6 +181,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._send_json(job, HTTPStatus.ACCEPTED)
             elif job_id := _match_job_action(path, "skip-pr"):
                 job = self.server_state.orchestrator.create_skip_pr_for_job(job_id)
+                self._send_json(job, HTTPStatus.ACCEPTED)
+            elif job_id := _match_job_action(path, "selected-tests-pr"):
+                job = self.server_state.orchestrator.create_selected_tests_pr_for_job(
+                    job_id,
+                    list(data.get("tests") or []),
+                )
                 self._send_json(job, HTTPStatus.ACCEPTED)
             elif job_id := (_match_job_action(path, "generated-tests", "remove") or _match_job_action(path, "generated-tests", "delete")):
                 job = self.server_state.orchestrator.delete_generated_tests_for_job(
@@ -141,6 +215,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._send_json(failure)
             else:
                 self._send_error(HTTPStatus.NOT_FOUND, f"Unknown endpoint: {path}")
+        except JobAlreadyActiveError as exc:
+            self._send_error(HTTPStatus.CONFLICT, str(exc))
         except Exception as exc:
             self._send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
 
@@ -158,14 +234,29 @@ class ApiHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode("utf-8")
         return json.loads(raw or "{}")
 
+    def _authorize(self) -> bool:
+        if not self._origin_is_allowed():
+            self._send_error(HTTPStatus.FORBIDDEN, "Browser origin is not allowed.")
+            return False
+        if not api_token_matches(self.api_token, self.headers.get("Authorization") or ""):
+            self._send_error(HTTPStatus.UNAUTHORIZED, "A valid GME Test Agent API token is required.")
+            return False
+        return True
+
+    def _origin_is_allowed(self) -> bool:
+        return is_allowed_origin(self.headers.get("Origin") or "")
+
     def _send_json(self, data: Any, status: HTTPStatus = HTTPStatus.OK) -> None:
         body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        origin = self.headers.get("Origin") or ""
+        if origin and is_allowed_origin(origin):
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
         self.end_headers()
         self.wfile.write(body)
 
@@ -184,6 +275,7 @@ class ApiHandler(BaseHTTPRequestHandler):
             "codex_skip_result.txt",
             "gtest_output.txt",
             "gtest_output_after_skip.txt",
+            "gtest_output_selected_pr.txt",
             "gtest_reproduce_before_fix.txt",
             "gtest_verify_after_fix.txt",
             "test_generation_prompt.md",
@@ -196,7 +288,8 @@ class ApiHandler(BaseHTTPRequestHandler):
         if artifact_dir.exists():
             for path in sorted(artifact_dir.iterdir()):
                 if path.is_file():
-                    files.append({"name": path.name, "size": path.stat().st_size})
+                    stat = path.stat()
+                    files.append({"name": path.name, "size": stat.st_size, "mtime": stat.st_mtime})
             for name in names:
                 path = artifact_dir / name
                 if path.exists() and path.is_file():

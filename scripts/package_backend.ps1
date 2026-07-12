@@ -52,6 +52,8 @@ Invoke-BackendPython @(
     $BackendPath,
     "--collect-submodules",
     "gme_agent",
+    "--add-data",
+    "$BackendPath\gme_agent\interface_catalog\catalogs;gme_agent/interface_catalog/catalogs",
     "--collect-all",
     "openai_codex",
     "--collect-all",

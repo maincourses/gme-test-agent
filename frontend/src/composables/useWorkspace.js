@@ -23,6 +23,7 @@ export const jobStatusLabels = {
 
 export const failureStatusLabels = {
   open: "未修复",
+  resolved: "本次未失败",
   fixing: "修复中",
   fix_ready: "待审查",
   fixed: "已修复",
@@ -31,8 +32,11 @@ export const failureStatusLabels = {
 };
 
 const activePage = ref("test");
+const testWorkspaceTab = ref("generate");
+const fixWorkspaceTab = ref("select");
 const activeJobTab = ref("results");
 const codeViewMode = ref("tests");
+const gtestFilterMode = ref("suggested");
 const selectedCodeFile = ref("");
 const loading = ref(false);
 const busyAction = ref("");
@@ -43,10 +47,21 @@ const validation = ref(null);
 const jobs = ref([]);
 const failures = ref([]);
 const events = ref([]);
+const testCaseResults = ref([]);
 const artifacts = ref({ artifact_dir: "", files: [], contents: {} });
 const selectedJobId = ref("");
+const fixEvents = ref([]);
+const fixArtifacts = ref({ artifact_dir: "", files: [], contents: {} });
+const selectedFixJobId = ref("");
+const selectedFailureJobId = ref("");
 const selectedFailureId = ref("");
 const selectedGeneratedTestKeys = ref([]);
+const interfaceCatalogModules = ref([]);
+const interfaceCatalog = ref({ module: "", summary: {}, files: [] });
+const interfaceCatalogLoading = ref(false);
+const interfaceSearch = ref("");
+const activeCatalogFile = ref("");
+const selectedInterfaceIds = ref([]);
 
 const configOptions = ref({
   branches: [],
@@ -88,7 +103,8 @@ const configForm = reactive({
 
 const testForm = reactive({
   module: "laws",
-  apiName: "",
+  extraRequirements: "",
+  testsPerInterface: 1,
   gtestFilter: "",
 });
 
@@ -112,17 +128,56 @@ function latestRealFailures(items) {
   return Array.from(latest.values()).sort((left, right) => failureTimestamp(right).localeCompare(failureTimestamp(left)));
 }
 
-const selectedJob = computed(() => jobs.value.find((job) => job.id === selectedJobId.value) || null);
+const testJobs = computed(() => jobs.value.filter((job) => job.type === "test_generation"));
+const fixJobs = computed(() => jobs.value.filter((job) => job.type === "bug_fix"));
+const selectedJob = computed(() => testJobs.value.find((job) => job.id === selectedJobId.value) || null);
+const selectedFixJob = computed(() => fixJobs.value.find((job) => job.id === selectedFixJobId.value) || null);
 const currentFailures = computed(() => latestRealFailures(failures.value));
+const repairableFailures = computed(() => {
+  const sourceJobs = new Map(testJobs.value.map((job) => [job.id, job]));
+  return currentFailures.value.filter((failure) => {
+    const sourceJob = sourceJobs.get(failure.job_id);
+    if (!sourceJob || ["resolved", "fixed", "ignored"].includes(failure.status)) return false;
+    return !isSubmittedFailure(failure, sourceJob);
+  });
+});
+const failureJobGroups = computed(() =>
+  testJobs.value
+    .map((job) => {
+      const groupedFailures = repairableFailures.value.filter((failure) => failure.job_id === job.id);
+      return {
+        job,
+        failures: groupedFailures,
+        openCount: groupedFailures.filter((failure) => failure.status === "open").length,
+        activeCount: groupedFailures.filter((failure) => ["fixing", "fix_ready"].includes(failure.status)).length,
+        latestAt: groupedFailures.reduce(
+          (latest, failure) => (failureTimestamp(failure) > latest ? failureTimestamp(failure) : latest),
+          job.updated_at || job.created_at || "",
+        ),
+      };
+    })
+    .filter((group) => group.failures.length)
+    .sort((left, right) => right.latestAt.localeCompare(left.latestAt)),
+);
+const selectedFailureJob = computed(() =>
+  failureJobGroups.value.find((group) => group.job.id === selectedFailureJobId.value)?.job || null,
+);
+const selectedFailureJobFailures = computed(() =>
+  failureJobGroups.value.find((group) => group.job.id === selectedFailureJobId.value)?.failures || [],
+);
 const selectedFailure = computed(() => currentFailures.value.find((failure) => failure.id === selectedFailureId.value) || failures.value.find((failure) => failure.id === selectedFailureId.value) || null);
 const selectedJobFailures = computed(() => currentFailures.value.filter((failure) => failure.job_id === selectedJobId.value));
 const selectedJobOpenFailures = computed(() => selectedJobFailures.value.filter((failure) => failure.status === "open"));
 const eventsText = computed(() => events.value.map((event) => `[${event.ts}] ${event.level}: ${event.message}`).join("\n"));
 const diffText = computed(() => artifacts.value.contents?.["diff.patch"] || "");
-const latestGtestOutput = computed(() => artifacts.value.contents?.["gtest_output_after_skip.txt"] || artifacts.value.contents?.["gtest_output.txt"] || "");
+const fixEventsText = computed(() => fixEvents.value.map((event) => `[${event.ts}] ${event.level}: ${event.message}`).join("\n"));
+const fixDiffText = computed(() => fixArtifacts.value.contents?.["diff.patch"] || "");
+const afterSkipGtestOutput = computed(() => artifacts.value.contents?.["gtest_output_after_skip.txt"] || "");
+const latestGtestOutput = computed(() => latestArtifactContent(["gtest_output.txt", "gtest_output_after_skip.txt", "gtest_output_selected_pr.txt"]));
 const codexText = computed(
   () => artifacts.value.contents?.["codex_skip_result.txt"] || artifacts.value.contents?.["codex_extend_result.txt"] || artifacts.value.contents?.["codex_result.txt"] || "",
 );
+const fixCodexText = computed(() => fixArtifacts.value.contents?.["codex_result.txt"] || "");
 const agentNotesText = computed(() => {
   const contents = artifacts.value.contents || {};
   return Object.keys(contents)
@@ -184,13 +239,15 @@ const generatedTestInfo = computed(() => {
     filterSummary: "全部测试",
   };
 });
-const generatedTestRows = computed(() => {
+const allGeneratedTestRows = computed(() => {
   const tests = generatedTestInfo.value.tests || [];
   const failuresByKey = new Map(selectedJobFailures.value.map((failure) => [`${failure.test_suite}.${failure.test_name}`, failure]));
+  const resultsByKey = new Map(testCaseResults.value.map((result) => [`${result.test_suite}.${result.test_name}`, result]));
   return tests.map((test, index) => {
     const fullName = `${test.suite}.${test.name}`;
     const failure = failuresByKey.get(fullName) || null;
-    const status = generatedTestStatus(fullName, failure, latestGtestOutput.value);
+    const persistedResult = resultsByKey.get(fullName) || null;
+    const status = generatedTestStatus(fullName, failure, persistedResult, latestGtestOutput.value);
     return {
       index: index + 1,
       file: normalizePath(test.file || ""),
@@ -207,6 +264,42 @@ const generatedTestRows = computed(() => {
     };
   });
 });
+const submittedTestNames = computed(() => {
+  const metadata = selectedJob.value?.metadata || {};
+  const names = new Set((metadata.submitted_test_names || []).map((name) => String(name)));
+  if (metadata.skip_pr_url || metadata.pr_url) {
+    for (const name of gtestNamesWithStatus(afterSkipGtestOutput.value, "SKIPPED")) names.add(name);
+  }
+  return names;
+});
+const submittedPrByTestName = computed(() => {
+  const metadata = selectedJob.value?.metadata || {};
+  const history = Array.isArray(metadata.test_prs) ? metadata.test_prs : [];
+  const result = new Map();
+  for (const item of history) {
+    const url = extractPrUrl(item?.url);
+    for (const name of item?.tests || []) {
+      result.set(String(name), { url, branch: String(item?.branch || "") });
+    }
+  }
+  return result;
+});
+const submittedTestRows = computed(() => {
+  const fallbackUrl = jobLatestPrUrl(selectedJob.value);
+  return allGeneratedTestRows.value
+    .filter((row) => submittedTestNames.value.has(row.fullName))
+    .map((row) => {
+      const pr = submittedPrByTestName.value.get(row.fullName) || {};
+      const prUrl = pr.url || fallbackUrl;
+      return {
+        ...row,
+        prUrl,
+        prLabel: pullRequestLabel(prUrl),
+        prBranch: pr.branch || "",
+      };
+    });
+});
+const generatedTestRows = computed(() => allGeneratedTestRows.value.filter((row) => !submittedTestNames.value.has(row.fullName)));
 const selectedGeneratedTestRows = computed(() => {
   const selected = new Set(selectedGeneratedTestKeys.value);
   return generatedTestRows.value.filter((row) => selected.has(row.fullName));
@@ -221,6 +314,7 @@ const testResultSummary = computed(() => {
     passed: rows.filter((row) => row.status === "passed").length,
     failed: rows.filter((row) => row.status === "failed").length,
     skipped: rows.filter((row) => row.status === "skipped").length,
+    submitted: submittedTestRows.value.length,
     unknown: rows.filter((row) => row.status === "unknown").length,
     hasOutput: Boolean(latestGtestOutput.value),
   };
@@ -284,13 +378,13 @@ const workflowSteps = computed(() => {
       state: stepState(job, "running_tests", fileNames.has("gtest_output.txt")),
     },
     {
-      label: "失败用例加 skip",
-      detail: "对当前最新失败写入 GTEST_SKIP",
-      state: stepState(job, "applying_skips", fileNames.has("codex_skip_result.txt") || fileNames.has("gtest_output_after_skip.txt")),
+      label: "准备选中测试",
+      detail: "失败测试写入 GTEST_SKIP，通过测试保持原样",
+      state: stepState(job, "applying_skips", fileNames.has("codex_skip_result.txt") || fileNames.has("gtest_output_selected_pr.txt")),
     },
     {
-      label: "创建 skip PR",
-      detail: job?.metadata?.skip_pr_url || job?.metadata?.pr_url || "生成 PR",
+      label: "创建测试 PR",
+      detail: jobLatestPrUrl(job) || "等待选择测试",
       state: stepState(job, "creating_pr", job?.status === "pr_created"),
     },
   ];
@@ -304,22 +398,58 @@ const workflowSteps = computed(() => {
 });
 
 const jobStats = computed(() => ({
-  total: jobs.value.length,
-  running: jobs.value.filter((job) => ["creating_worktree", "running_codex", "building", "running_tests", "applying_skips", "creating_pr"].includes(job.status)).length,
-  review: jobs.value.filter((job) => job.status === "needs_review").length,
-  failed: jobs.value.filter((job) => job.status === "failed").length,
+  total: testJobs.value.length,
+  running: testJobs.value.filter((job) => job.active || ["creating_worktree", "running_codex", "building", "running_tests", "applying_skips", "creating_pr"].includes(job.status)).length,
+  review: testJobs.value.filter((job) => job.status === "needs_review").length,
+  failed: testJobs.value.filter((job) => job.status === "failed").length,
 }));
 
 const failureStats = computed(() => ({
-  total: currentFailures.value.length,
-  open: currentFailures.value.filter((failure) => failure.status === "open").length,
-  fixing: currentFailures.value.filter((failure) => ["fixing", "fix_ready"].includes(failure.status)).length,
+  total: repairableFailures.value.length,
+  open: repairableFailures.value.filter((failure) => failure.status === "open").length,
+  fixing: repairableFailures.value.filter((failure) => ["fixing", "fix_ready"].includes(failure.status)).length,
   fixed: currentFailures.value.filter((failure) => failure.status === "fixed").length,
 }));
 
+const catalogFiles = computed(() => interfaceCatalog.value.files || []);
+const allCatalogInterfaces = computed(() => catalogFiles.value.flatMap((file) => file.interfaces || []));
+const visibleCatalogInterfaces = computed(() => {
+  const query = interfaceSearch.value.trim().toLowerCase();
+  const file = catalogFiles.value.find((item) => item.path === activeCatalogFile.value);
+  return (file?.interfaces || [])
+    .filter((item) => {
+      if (!query) return true;
+      return [item.name, item.unique_symbol, item.source_catalog, item.kind, item.test_suite]
+        .some((value) => String(value || "").toLowerCase().includes(query));
+    })
+    .map((item) => ({ ...item, target_file: file.path }));
+});
+const selectedCatalogInterfaces = computed(() => {
+  const selected = new Set(selectedInterfaceIds.value);
+  return allCatalogInterfaces.value.filter((item) => selected.has(item.id));
+});
+const maxTestsPerInterface = computed(() => Math.max(1, Number(interfaceCatalog.value.max_tests_per_interface) || 5));
+const catalogSelectionSummary = computed(() => {
+  const files = new Set(selectedCatalogInterfaces.value.map((item) => item.target_file));
+  const interfaceCount = selectedCatalogInterfaces.value.length;
+  const testsPerInterface = Math.min(
+    maxTestsPerInterface.value,
+    Math.max(1, Math.trunc(Number(testForm.testsPerInterface) || 1)),
+  );
+  return {
+    fileCount: files.size,
+    interfaceCount,
+    requestedTestCount: interfaceCount * testsPerInterface,
+    maxInterfaces: Number(interfaceCatalog.value.max_selected_interfaces || 20),
+  };
+});
+
 const branchOptions = computed(() => withCurrent(configOptions.value.branches, configForm.base_branch));
 const remoteOptions = computed(() => withCurrent(configOptions.value.remotes, configForm.github_remote));
-const moduleOptions = computed(() => withCurrent(configOptions.value.modules, testForm.module));
+const moduleOptions = computed(() => {
+  const modules = interfaceCatalogModules.value.map((item) => item.module).filter(Boolean);
+  return modules.length ? modules : ["base", "laws"];
+});
 const sandboxOptions = computed(() => withCurrent(configOptions.value.sandbox_options, configForm.sandbox));
 const approvalPolicyOptions = computed(() => withCurrent(configOptions.value.approval_policy_options, configForm.approval_policy));
 
@@ -350,13 +480,31 @@ watch(
 
 watch(selectedJobId, () => {
   selectedGeneratedTestKeys.value = [];
+  testForm.gtestFilter = "";
+  gtestFilterMode.value = "suggested";
 });
+
+watch(fixWorkspaceTab, (tab) => {
+  if (tab === "select") syncFailureSelection();
+});
+
+watch(
+  () => testForm.module,
+  (module) => {
+    if (module && module !== interfaceCatalog.value.module) {
+      loadInterfaceCatalog(module);
+    }
+  },
+);
 
 export function useWorkspace() {
   return {
     activePage,
+    testWorkspaceTab,
+    fixWorkspaceTab,
     activeJobTab,
     codeViewMode,
+    gtestFilterMode,
     selectedCodeFile,
     loading,
     busyAction,
@@ -368,26 +516,47 @@ export function useWorkspace() {
     configForm,
     testForm,
     jobs,
+    testJobs,
+    fixJobs,
     failures,
     currentFailures,
     events,
     artifacts,
     selectedJobId,
+    fixEvents,
+    fixArtifacts,
+    selectedFixJobId,
+    selectedFailureJobId,
     selectedFailureId,
     selectedJob,
+    selectedFixJob,
+    selectedFailureJob,
     selectedFailure,
+    repairableFailures,
+    failureJobGroups,
+    selectedFailureJobFailures,
     selectedJobFailures,
     selectedJobOpenFailures,
     eventsText,
     diffText,
+    fixEventsText,
+    fixDiffText,
     latestGtestOutput,
     codexText,
+    fixCodexText,
     agentNotesText,
     jobDetailJson,
     failureDetailJson,
     generatedTestInfo,
     generatedTestRows,
+    submittedTestRows,
     selectedGeneratedTestKeys,
+    interfaceCatalogModules,
+    interfaceCatalog,
+    interfaceCatalogLoading,
+    interfaceSearch,
+    activeCatalogFile,
+    selectedInterfaceIds,
     selectedGeneratedTestRows,
     selectedGeneratedTestCount,
     testResultSummary,
@@ -396,6 +565,10 @@ export function useWorkspace() {
     workflowSteps,
     jobStats,
     failureStats,
+    catalogFiles,
+    visibleCatalogInterfaces,
+    selectedCatalogInterfaces,
+    catalogSelectionSummary,
     branchOptions,
     remoteOptions,
     moduleOptions,
@@ -404,17 +577,24 @@ export function useWorkspace() {
     refreshAll,
     refreshRuntime,
     loadSelectedJobData,
+    loadSelectedFixJobData,
     selectJob,
+    selectFixJob,
+    selectFailureJob,
     selectFailure,
     saveConfig,
     chooseDirectory,
     chooseFile,
     validateEnvironment,
+    selectCatalogFile,
+    toggleCatalogInterface,
+    clearCatalogSelection,
+    clampTestsPerInterface,
     createTestJob,
     extendSelectedTestJob,
     buildSelectedJob,
     runSelectedTests,
-    createSkipPrForSelectedJob,
+    createSelectedTestsPr,
     deleteSelectedGeneratedTests,
     cleanupSelectedJob,
     deleteSelectedJob,
@@ -428,6 +608,7 @@ export function useWorkspace() {
     statusTone,
     copyText,
     openPr,
+    openPrUrl,
     setError,
   };
 }
@@ -437,6 +618,8 @@ async function refreshAll() {
   try {
     await loadConfig();
     await loadConfigOptions();
+    await loadInterfaceCatalogOptions();
+    await loadInterfaceCatalog(testForm.module);
     await refreshRuntime(true);
     backendOk.value = true;
   } catch (err) {
@@ -454,11 +637,15 @@ async function refreshRuntime(silent = false) {
     jobs.value = jobsData.jobs || [];
     failures.value = failuresData.failures || [];
     const selectableFailures = latestRealFailures(failures.value);
-    if (selectedJobId.value && !jobs.value.some((job) => job.id === selectedJobId.value)) selectedJobId.value = "";
-    if (!selectedJobId.value && jobs.value.length) selectedJobId.value = jobs.value[0].id;
+    const selectableTestJobs = jobs.value.filter((job) => job.type === "test_generation");
+    const selectableFixJobs = jobs.value.filter((job) => job.type === "bug_fix");
+    if (selectedJobId.value && !selectableTestJobs.some((job) => job.id === selectedJobId.value)) selectedJobId.value = "";
+    if (!selectedJobId.value && selectableTestJobs.length) selectedJobId.value = selectableTestJobs[0].id;
+    if (selectedFixJobId.value && !selectableFixJobs.some((job) => job.id === selectedFixJobId.value)) selectedFixJobId.value = "";
     if (selectedFailureId.value && !selectableFailures.some((failure) => failure.id === selectedFailureId.value)) selectedFailureId.value = "";
-    if (!selectedFailureId.value && selectableFailures.length) selectedFailureId.value = selectableFailures[0].id;
-    await loadSelectedJobData();
+    if (fixWorkspaceTab.value === "select") syncFailureSelection();
+    else if (!selectedFailureId.value && selectableFailures.length) selectedFailureId.value = selectableFailures[0].id;
+    await Promise.all([loadSelectedJobData(), loadSelectedFixJobData()]);
     backendOk.value = true;
   } catch (err) {
     backendOk.value = false;
@@ -480,27 +667,155 @@ async function loadConfigOptions() {
   }
 }
 
+async function loadInterfaceCatalogOptions() {
+  const data = await api.listInterfaceCatalogs();
+  interfaceCatalogModules.value = data.modules || [];
+  const modules = interfaceCatalogModules.value.map((item) => item.module);
+  if (!modules.includes(testForm.module)) {
+    testForm.module = modules[0] || "laws";
+  }
+}
+
+async function loadInterfaceCatalog(module) {
+  if (!module) return;
+  interfaceCatalogLoading.value = true;
+  try {
+    const previousModule = interfaceCatalog.value.module;
+    const data = await api.getInterfaceCatalog(module);
+    interfaceCatalog.value = data || { module, summary: {}, files: [] };
+    const validFiles = new Set((interfaceCatalog.value.files || []).map((file) => file.path));
+    const validIds = new Set(
+      (interfaceCatalog.value.files || []).flatMap((file) => (file.interfaces || []).map((item) => item.id)),
+    );
+    if (previousModule !== module) {
+      activeCatalogFile.value = "";
+      selectedInterfaceIds.value = [];
+      interfaceSearch.value = "";
+    } else {
+      if (!validFiles.has(activeCatalogFile.value)) activeCatalogFile.value = "";
+      selectedInterfaceIds.value = selectedInterfaceIds.value.filter((id) => validIds.has(id));
+    }
+    if (!activeCatalogFile.value && interfaceCatalog.value.files?.length) {
+      activeCatalogFile.value = interfaceCatalog.value.files[0].path;
+    }
+  } catch (err) {
+    setError(err);
+  } finally {
+    interfaceCatalogLoading.value = false;
+  }
+}
+
+function selectCatalogFile(path) {
+  activeCatalogFile.value = path;
+}
+
+function toggleCatalogInterface(interfaceId, checked) {
+  const selected = new Set(selectedInterfaceIds.value);
+  if (checked) {
+    if (selected.size >= catalogSelectionSummary.value.maxInterfaces && !selected.has(interfaceId)) {
+      setError(`每个任务最多选择 ${catalogSelectionSummary.value.maxInterfaces} 个接口。`);
+      return;
+    }
+    selected.add(interfaceId);
+  } else {
+    selected.delete(interfaceId);
+  }
+  selectedInterfaceIds.value = [...selected];
+}
+
+function clearCatalogSelection() {
+  selectedInterfaceIds.value = [];
+}
+
+function clampTestsPerInterface(event) {
+  const rawValue = event?.target?.value ?? event;
+  const parsedValue = Number(rawValue);
+  const normalizedValue = Number.isFinite(parsedValue)
+    ? Math.min(maxTestsPerInterface.value, Math.max(1, Math.trunc(parsedValue)))
+    : 1;
+  testForm.testsPerInterface = normalizedValue;
+  if (event?.target) event.target.value = String(normalizedValue);
+}
+
 async function loadSelectedJobData() {
   if (!selectedJobId.value) {
     events.value = [];
+    testCaseResults.value = [];
     artifacts.value = { artifact_dir: "", files: [], contents: {} };
     return;
   }
-  const [eventsData, artifactsData] = await Promise.all([
+  const [eventsData, artifactsData, testResultsData] = await Promise.all([
     api.getJobEvents(selectedJobId.value),
     api.getJobArtifacts(selectedJobId.value),
+    api.getJobTestResults(selectedJobId.value),
   ]);
   events.value = eventsData.events || [];
   artifacts.value = artifactsData || { artifact_dir: "", files: [], contents: {} };
+  testCaseResults.value = testResultsData.results || [];
+}
+
+async function loadSelectedFixJobData() {
+  if (!selectedFixJobId.value) {
+    fixEvents.value = [];
+    fixArtifacts.value = { artifact_dir: "", files: [], contents: {} };
+    return;
+  }
+  const [eventsData, artifactsData] = await Promise.all([
+    api.getJobEvents(selectedFixJobId.value),
+    api.getJobArtifacts(selectedFixJobId.value),
+  ]);
+  fixEvents.value = eventsData.events || [];
+  fixArtifacts.value = artifactsData || { artifact_dir: "", files: [], contents: {} };
 }
 
 async function selectJob(jobId) {
+  const job = jobs.value.find((item) => item.id === jobId);
+  if (job && job.type !== "test_generation") {
+    setError("测试 Agent 只能打开测试生成任务。");
+    return;
+  }
   selectedJobId.value = jobId;
   await loadSelectedJobData();
 }
 
+async function selectFixJob(jobId) {
+  const job = jobs.value.find((item) => item.id === jobId);
+  if (job && job.type !== "bug_fix") {
+    setError("修复 Agent 只能打开修复任务。");
+    return;
+  }
+  selectedFixJobId.value = jobId;
+  await loadSelectedFixJobData();
+}
+
 function selectFailure(failureId) {
   selectedFailureId.value = failureId;
+  const failure = currentFailures.value.find((item) => item.id === failureId) || failures.value.find((item) => item.id === failureId);
+  if (failure?.job_id) selectedFailureJobId.value = failure.job_id;
+}
+
+function selectFailureJob(jobId) {
+  selectedFailureJobId.value = jobId;
+  syncFailureSelection();
+}
+
+function syncFailureSelection() {
+  const groups = failureJobGroups.value;
+  if (!groups.some((group) => group.job.id === selectedFailureJobId.value)) {
+    selectedFailureJobId.value = groups[0]?.job.id || "";
+  }
+  const visibleFailures = selectedFailureJobFailures.value;
+  if (!visibleFailures.some((failure) => failure.id === selectedFailureId.value)) {
+    selectedFailureId.value = visibleFailures[0]?.id || "";
+  }
+}
+
+function isSubmittedFailure(failure, sourceJob) {
+  const metadata = sourceJob?.metadata || {};
+  const submittedIds = new Set((metadata.skip_failure_ids || []).map((id) => String(id)));
+  const submittedNames = new Set((metadata.submitted_test_names || []).map((name) => String(name)));
+  const fullName = failure?.test_suite && failure?.test_name ? `${failure.test_suite}.${failure.test_name}` : "";
+  return submittedIds.has(String(failure?.id || "")) || (fullName && submittedNames.has(fullName));
 }
 
 async function saveConfig() {
@@ -537,12 +852,18 @@ async function validateEnvironment() {
 
 async function createTestJob() {
   await runAction("生成测试", async () => {
+    if (!selectedInterfaceIds.value.length) {
+      throw new Error("请至少选择一个接口。");
+    }
     const job = await api.createTestJob({
-      module: testForm.module || "gme",
-      api_name: testForm.apiName,
+      module: testForm.module,
+      interface_ids: [...selectedInterfaceIds.value],
+      tests_per_interface: Number(testForm.testsPerInterface),
+      extra_requirements: testForm.extraRequirements,
     });
     selectedJobId.value = job.id;
     activePage.value = "test";
+    testWorkspaceTab.value = "review";
   });
 }
 
@@ -554,9 +875,18 @@ async function extendSelectedTestJob() {
     if (!job.worktree_path) {
       throw new Error("选中任务还没有工作区，不能继续扩展。");
     }
+    if (job.module !== testForm.module) {
+      throw new Error(`当前任务属于 ${job.module} 模块，请切换到同一模块后再继续扩展。`);
+    }
+    if (!selectedInterfaceIds.value.length) {
+      throw new Error("请至少选择一个要继续扩展的接口。");
+    }
     await api.extendTestJob(job.id, {
-      api_name: testForm.apiName,
+      interface_ids: [...selectedInterfaceIds.value],
+      tests_per_interface: Number(testForm.testsPerInterface),
+      extra_requirements: testForm.extraRequirements,
     });
+    testWorkspaceTab.value = "review";
   });
 }
 
@@ -567,17 +897,50 @@ async function buildSelectedJob() {
 async function runSelectedTests() {
   await withSelectedJob("运行选中测试", (job) =>
     api.runTests(job.id, {
-      gtest_filter: testForm.gtestFilter || generatedTestInfo.value.filter || "*",
+      gtest_filter: gtestFilterMode.value === "custom"
+        ? testForm.gtestFilter || "*"
+        : generatedTestInfo.value.filter || "*",
     }),
   );
 }
 
-async function createSkipPrForSelectedJob() {
-  await withSelectedJob("加 skip 并创建 PR", (job) => {
-    if (!selectedJobOpenFailures.value.length) {
-      throw new Error("当前任务没有最新未处理失败用例。");
-    }
-    return api.createSkipPr(job.id);
+async function createSelectedTestsPr() {
+  const job = selectedJob.value;
+  if (!job) {
+    setError("请先选择一个任务。");
+    return;
+  }
+  if (job.active) {
+    setError("当前任务正在执行其他操作，请等待完成后再提交 PR。");
+    return;
+  }
+  const rows = selectedGeneratedTestRows.value;
+  if (!rows.length) {
+    setError("请先选择要提交的生成测试。");
+    return;
+  }
+  const unknown = rows.filter((row) => row.status === "unknown");
+  if (unknown.length) {
+    setError(`有 ${unknown.length} 个选中测试尚未确认，请先运行这些测试再创建 PR。`);
+    return;
+  }
+
+  const passed = rows.filter((row) => row.status === "passed").length;
+  const failed = rows.filter((row) => row.status === "failed").length;
+  const skipped = rows.filter((row) => row.status === "skipped").length;
+  const detail = [
+    `将提交 ${rows.length} 个选中测试。`,
+    `通过 ${passed} 个，失败 ${failed} 个，已跳过 ${skipped} 个。`,
+    failed ? "失败测试会先增加 GTEST_SKIP()，未选中的生成测试不会进入 PR。" : "未选中的生成测试不会进入 PR。",
+  ].join("\n");
+  if (!window.confirm(detail)) return;
+
+  await runAction("提交选中测试 PR", async () => {
+    await api.createSelectedTestsPr(
+      job.id,
+      rows.map((row) => ({ suite: row.suite, name: row.name })),
+    );
+    selectedGeneratedTestKeys.value = [];
   });
 }
 
@@ -585,6 +948,10 @@ async function deleteSelectedGeneratedTests() {
   const job = selectedJob.value;
   if (!job) {
     setError("请先选择一个任务。");
+    return;
+  }
+  if (job.active) {
+    setError("当前任务正在执行其他操作，请等待完成后再删除测试。");
     return;
   }
   if (job.type !== "test_generation") {
@@ -622,6 +989,10 @@ async function deleteSelectedJob() {
     setError("请先选择一个任务。");
     return;
   }
+  if (job.active) {
+    setError("当前任务正在执行其他操作，请等待完成后再删除任务。");
+    return;
+  }
   if (!window.confirm("确定要删除选中任务记录吗？会同时清理该任务的工作区和产物目录，此操作不可恢复。")) return;
   await runAction("删除任务记录", async () => {
     await api.deleteJob(job.id, { cleanup_worktree: true, delete_artifacts: true });
@@ -637,8 +1008,9 @@ async function fixSelectedFailure() {
   }
   await runAction("修复选中失败", async () => {
     const job = await api.fixFailure(selectedFailure.value.id);
-    selectedJobId.value = job.id;
-    activePage.value = "test";
+    selectedFixJobId.value = job.id;
+    activePage.value = "fix";
+    fixWorkspaceTab.value = "review";
   });
 }
 
@@ -656,6 +1028,7 @@ async function reproduceSelectedFailure() {
   testForm.gtestFilter = filter;
   selectedJobId.value = failure.job_id;
   activePage.value = "test";
+  testWorkspaceTab.value = "review";
   await runAction("复现失败", () => api.runTests(failure.job_id, { gtest_filter: filter }));
 }
 
@@ -670,6 +1043,10 @@ async function markSelectedFailure(status) {
 async function withSelectedJob(label, action) {
   if (!selectedJob.value) {
     setError("请先选择一个任务。");
+    return;
+  }
+  if (selectedJob.value.active) {
+    setError("当前任务正在执行其他操作，请等待完成后再试。");
     return;
   }
   await runAction(label, () => action(selectedJob.value));
@@ -700,7 +1077,10 @@ function normalizePath(path) {
     .replace(/^\/+/, "");
 }
 
-function generatedTestStatus(fullName, failure, output) {
+function generatedTestStatus(fullName, failure, persistedResult, output) {
+  if (["passed", "failed", "skipped"].includes(persistedResult?.status)) {
+    return persistedResult.status;
+  }
   if (failure?.status === "open") return "failed";
   if (hasGtestLine(output, "FAILED", fullName)) return "failed";
   if (hasGtestLine(output, "OK", fullName)) return "passed";
@@ -715,6 +1095,34 @@ function generatedTestStatusLabel(status) {
     skipped: "已跳过",
     unknown: "未确认",
   }[status] || status;
+}
+
+function latestArtifactContent(names) {
+  const contents = artifacts.value.contents || {};
+  const candidates = names.filter((name) => contents[name]);
+  if (!candidates.length) return "";
+  const timed = candidates
+    .map((name) => ({ name, mtime: artifactMtime(name) }))
+    .filter((item) => item.mtime > 0)
+    .sort((left, right) => right.mtime - left.mtime);
+  if (timed.length) return contents[timed[0].name] || "";
+  return contents["gtest_output_after_skip.txt"] || contents["gtest_output.txt"] || "";
+}
+
+function artifactMtime(name) {
+  const item = (artifacts.value.files || []).find((file) => file.name === name);
+  return Number(item?.mtime || 0);
+}
+
+function gtestNamesWithStatus(output, status) {
+  if (!output) return [];
+  const names = [];
+  const pattern = new RegExp(`\\[\\s*${status}\\s*\\]\\s+([^\\s(]+)`, "g");
+  let match;
+  while ((match = pattern.exec(output)) !== null) {
+    names.push(match[1]);
+  }
+  return names;
 }
 
 function hasGtestLine(output, status, fullName) {
@@ -868,12 +1276,48 @@ async function copyText(text) {
 }
 
 function openPr() {
-  const url = selectedJob.value?.metadata?.pr_url;
+  const url = jobLatestPrUrl(selectedJob.value);
   if (!url) {
     setError("选中任务还没有 PR 链接。");
     return;
   }
   window.open(url, "_blank", "noopener,noreferrer");
+}
+
+function openPrUrl(value) {
+  const url = extractPrUrl(value);
+  if (!url) {
+    setError("这条已提交测试没有可用的 PR 链接。");
+    return;
+  }
+  window.open(url, "_blank", "noopener,noreferrer");
+}
+
+function pullRequestLabel(value) {
+  const url = extractPrUrl(value);
+  const match = /\/pull\/(\d+)/.exec(url);
+  return match ? `#${match[1]}` : "打开 PR";
+}
+
+function jobLatestPrUrl(job) {
+  const metadata = job?.metadata || {};
+  const history = Array.isArray(metadata.test_prs) ? metadata.test_prs : [];
+  const candidates = [
+    ...history.map((item) => item?.url).reverse(),
+    metadata.selected_pr_url,
+    metadata.pr_url,
+    metadata.skip_pr_url,
+  ];
+  for (const value of candidates) {
+    const url = extractPrUrl(value);
+    if (url) return url;
+  }
+  return "";
+}
+
+function extractPrUrl(value) {
+  const matches = String(value || "").match(/https?:\/\/[^\s]+\/pull\/\d+(?:[^\s]*)?/g);
+  return matches?.length ? matches[matches.length - 1].replace(/[.,;)]*$/, "") : "";
 }
 
 function setNotice(message) {

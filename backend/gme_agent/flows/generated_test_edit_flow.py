@@ -66,6 +66,9 @@ def delete_generated_tests(ctx, job_id: str, tests: list[dict[str, str]]) -> dic
     deleted_failures = ctx.db.delete_failures_for_tests(job_id, sorted(selected))
     if deleted_failures:
         emit("info", f"Removed {deleted_failures} failure record(s) for deleted generated tests.")
+    deleted_results = ctx.db.delete_test_case_results_for_tests(job_id, sorted(selected))
+    if deleted_results:
+        emit("info", f"Removed {deleted_results} persisted test result(s) for deleted generated tests.")
 
     refreshed_manifest = load_generated_tests_manifest(worktree, target_repo)
     metadata = ctx._merge_metadata(

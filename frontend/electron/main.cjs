@@ -1,5 +1,6 @@
 const { app, BrowserWindow, dialog, ipcMain, shell } = require("electron");
 const { spawn, spawnSync } = require("node:child_process");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const http = require("node:http");
 const path = require("node:path");
@@ -8,6 +9,8 @@ const BACKEND_HOST = "127.0.0.1";
 const BACKEND_PORT = Number(process.env.GME_AGENT_BACKEND_PORT || "8765");
 const BACKEND_URL = `http://${BACKEND_HOST}:${BACKEND_PORT}`;
 const CONDA_ENV = process.env.GME_AGENT_CONDA_ENV || "py311";
+const API_TOKEN = process.env.GME_AGENT_API_TOKEN || crypto.randomBytes(32).toString("hex");
+process.env.GME_AGENT_API_TOKEN = API_TOKEN;
 
 let backendProcess = null;
 let backendProcessPid = 0;
@@ -90,10 +93,26 @@ async function findCondaCommand() {
 
 async function backendHealth() {
   return new Promise((resolve) => {
-    const req = http.get(`${BACKEND_URL}/api/health`, { timeout: 1200 }, (res) => {
-      res.resume();
-      resolve(res.statusCode === 200);
-    });
+    const req = http.get(
+      `${BACKEND_URL}/api/health`,
+      {
+        timeout: 1200,
+        headers: { Authorization: `Bearer ${API_TOKEN}` },
+      },
+      (res) => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => { body += chunk; });
+        res.on("end", () => {
+          try {
+            const data = JSON.parse(body || "{}");
+            resolve(res.statusCode === 200 && data.authenticated === true);
+          } catch {
+            resolve(false);
+          }
+        });
+      },
+    );
     req.on("timeout", () => {
       req.destroy();
       resolve(false);

@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 
-FAILURE_STATUSES = {"open", "fixing", "fix_ready", "fixed", "ignored", "fix_failed"}
+FAILURE_STATUSES = {"open", "resolved", "fixing", "fix_ready", "fixed", "ignored", "fix_failed"}
 
 
 def update_failure_status(db, failure_id: str, status: str) -> dict[str, Any]:

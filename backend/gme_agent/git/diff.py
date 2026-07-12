@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Iterable
+import re
 import shutil
 import subprocess
 
@@ -10,6 +11,7 @@ from .worktree import EventCallback, is_git_repo, normalize_repo_path, run_git
 
 
 IGNORED_WORKTREE_ARTIFACT_PATTERNS = ("timer_res",)
+PR_URL_PATTERN = re.compile(r"https?://[^\s]+/pull/\d+(?:[^\s]*)?")
 
 
 def ensure_only_target_repo_changed(
@@ -140,13 +142,21 @@ def create_pr(
         encoding="utf-8",
         errors="replace",
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE,
     )
-    if proc.stdout.strip():
-        emit("cmd", proc.stdout.strip())
+    output = "\n".join(
+        part.strip()
+        for part in (getattr(proc, "stdout", ""), getattr(proc, "stderr", ""))
+        if part and part.strip()
+    )
+    if output:
+        emit("cmd", output)
     if proc.returncode != 0:
-        raise RuntimeError(proc.stdout.strip() or "gh pr create failed")
-    return proc.stdout.strip()
+        raise RuntimeError(output or "gh pr create failed")
+    matches = PR_URL_PATTERN.findall(output)
+    if not matches:
+        raise RuntimeError("gh pr create succeeded but did not return a pull request URL.")
+    return matches[-1].rstrip(".,;)")
 
 
 def _status_path(line: str) -> str:

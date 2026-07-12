@@ -15,6 +15,10 @@ from ..prompts import skip_known_failure_prompt
 
 
 def run_skip_pr_job(ctx, job_id: str) -> None:
+    run_selected_tests_pr_job(ctx, job_id, None)
+
+
+def run_selected_tests_pr_job(ctx, job_id: str, selected_tests: list[dict[str, str]] | None) -> None:
     emit = ctx._job_emit(job_id)
     job = ctx.db.get_job(job_id)
     worktree_path = job.get("worktree_path")
@@ -32,50 +36,90 @@ def run_skip_pr_job(ctx, job_id: str) -> None:
         target_repo = ctx._job_target_repo(job)
         target_path = ctx._target_repo_path(worktree, target_repo)
         restore_target_path = target_path
-        failures = _latest_open_failures_for_job(ctx.db.list_failures(), job_id)
-        if not failures:
-            raise RuntimeError("No latest open failures were found for the selected job.")
-
         manifest_tests = _job_generated_tests(job)
-        commit_rel_paths = _skip_pr_test_paths(job, failures, target_path, manifest_tests)
-        allowed_files = [normalize_repo_path(f"{target_repo}/{path}") for path in commit_rel_paths]
-        test_log = _read_text(artifact_dir / "gtest_output.txt")
-        prompt = skip_known_failure_prompt(test_log, failures, target_repo, allowed_files)
-        (artifact_dir / "skip_prompt.md").write_text(prompt, encoding="utf-8")
+        if not manifest_tests:
+            raise RuntimeError("The selected job has no generated_tests.json entries to submit.")
 
-        ctx.db.update_job(job_id, status="applying_skips")
-        codex = CodexRunner(ctx.config, emit)
-        result = codex.run(prompt, worktree, job.get("codex_thread_id"), skill_names=ctx._test_skill_names())
-        (artifact_dir / "codex_skip_result.txt").write_text(result.final_response, encoding="utf-8")
-        if result.thread_id:
-            ctx.db.update_job(job_id, codex_thread_id=result.thread_id)
+        open_failures = _latest_open_failures_for_job(ctx.db.list_failures(), job_id)
+        requested_tests = selected_tests
+        if requested_tests is None:
+            requested_tests = [
+                {
+                    "suite": str(failure.get("test_suite") or ""),
+                    "name": str(failure.get("test_name") or ""),
+                }
+                for failure in open_failures
+            ]
+        selected_manifest_tests = _selected_manifest_tests(manifest_tests, requested_tests)
+        selected_keys = {(item["suite"], item["name"]) for item in selected_manifest_tests}
+        submitted_names = _submitted_test_names(job)
+        duplicate_names = sorted(f"{suite}.{name}" for suite, name in selected_keys if f"{suite}.{name}" in submitted_names)
+        if duplicate_names:
+            raise RuntimeError("Selected tests were already submitted in a PR: " + ", ".join(duplicate_names))
+
+        test_log = _latest_test_output(artifact_dir)
+        passing_keys, skipped_keys, failures = _classify_selected_tests(
+            selected_keys,
+            open_failures,
+            test_log,
+        )
+        commit_rel_paths = _selected_pr_test_paths(selected_manifest_tests, target_path)
+        allowed_files = [normalize_repo_path(f"{target_repo}/{path}") for path in commit_rel_paths]
+
+        if failures:
+            prompt = skip_known_failure_prompt(test_log, failures, target_repo, allowed_files)
+            (artifact_dir / "skip_prompt.md").write_text(prompt, encoding="utf-8")
+
+            ctx.db.update_job(job_id, status="applying_skips")
+            codex = CodexRunner(ctx.config, emit)
+            result = codex.run(prompt, worktree, job.get("codex_thread_id"), skill_names=ctx._test_skill_names())
+            (artifact_dir / "codex_skip_result.txt").write_text(result.final_response, encoding="utf-8")
+            if result.thread_id:
+                ctx.db.update_job(job_id, codex_thread_id=result.thread_id)
 
         _format_generated_tests(worktree, target_path, commit_rel_paths, emit)
         full_generated_snapshots = _snapshot_generated_tests(target_path, commit_rel_paths)
-        if manifest_tests:
-            _prune_manifest_tests_to_failures(target_path, commit_rel_paths, failures, manifest_tests, emit)
-        else:
-            _prune_generated_tests_to_failures(target_path, commit_rel_paths, failures, emit)
+        required_skip_keys = skipped_keys | {
+            (str(failure.get("test_suite") or ""), str(failure.get("test_name") or ""))
+            for failure in failures
+        }
+        _prune_manifest_tests_to_selection(
+            target_path,
+            commit_rel_paths,
+            selected_keys,
+            required_skip_keys,
+            manifest_tests,
+            emit,
+        )
         _format_generated_tests(worktree, target_path, commit_rel_paths, emit)
         ctx._run_configure_and_build(job_id, worktree)
-        gtest_filter = _failure_suite_filter(failures)
-        output = ctx._run_tests(job_id, worktree, gtest_filter, artifact_name="gtest_output_after_skip.txt")
+        gtest_filter = _test_keys_filter(selected_keys)
+        output = ctx._run_tests(job_id, worktree, gtest_filter, artifact_name="gtest_output_selected_pr.txt")
+        _require_selected_tests_reported(output, selected_keys)
         remaining_failures = ctx._record_failures(job_id, output, gtest_filter, artifact_dir=artifact_dir)
         ctx._write_job_artifacts(job_id, worktree, artifact_dir)
         if remaining_failures:
             names = ", ".join(f"{item.get('test_suite')}.{item.get('test_name')}" for item in remaining_failures)
-            raise RuntimeError(f"Tests still failed after adding skips; PR was not created. Remaining failures: {names}")
+            raise RuntimeError(f"Selected tests still failed; PR was not created. Remaining failures: {names}")
+        _validate_selected_test_results(output, passing_keys, required_skip_keys)
 
         ctx.db.update_job(job_id, status="creating_pr")
         task_target_branch = str(job.get("metadata", {}).get("target_branch") or branch)
         restore_branch = task_target_branch
-        skip_branch = _skip_pr_branch_name(job)
+        skip_branch = _selected_pr_branch_name(job)
         target_base_branch = str(job.get("metadata", {}).get("target_base_branch") or ctx.config.base_branch)
         title = _skip_pr_title(job)
         _checkout_new_skip_branch(target_path, skip_branch, emit)
         commit_paths(target_path, commit_rel_paths, title, emit)
         push_branch(ctx.config, target_path, skip_branch, emit)
-        pr_url = create_pr(ctx.config, target_path, title, _skip_pr_body(job, failures, gtest_filter), emit, base_branch=target_base_branch)
+        pr_url = create_pr(
+            ctx.config,
+            target_path,
+            title,
+            _selected_pr_body(selected_manifest_tests, failures, has_skips=bool(required_skip_keys)),
+            emit,
+            base_branch=target_base_branch,
+        )
         _checkout_branch(target_path, task_target_branch, emit)
         _restore_generated_tests(target_path, full_generated_snapshots, emit)
         restored_paths = sorted(full_generated_snapshots)
@@ -84,12 +128,35 @@ def run_skip_pr_job(ctx, job_id: str) -> None:
 
         metadata = dict(ctx.db.get_job(job_id).get("metadata") or {})
         metadata["pr_url"] = pr_url
-        metadata["skip_pr_url"] = pr_url
-        metadata["skip_pr_branch"] = skip_branch
-        metadata["skip_failure_ids"] = [str(failure.get("id") or "") for failure in failures]
+        selected_names = [f"{item['suite']}.{item['name']}" for item in selected_manifest_tests]
+        metadata["selected_pr_url"] = pr_url
+        metadata["selected_pr_branch"] = skip_branch
+        metadata["submitted_test_names"] = _ordered_unique(
+            [*list(metadata.get("submitted_test_names") or []), *selected_names]
+        )
+        metadata["test_prs"] = [
+            *list(metadata.get("test_prs") or []),
+            {
+                "url": pr_url,
+                "branch": skip_branch,
+                "tests": selected_names,
+                "skipped_tests": sorted(f"{suite}.{name}" for suite, name in required_skip_keys),
+            },
+        ]
+        failure_ids = [str(failure.get("id") or "") for failure in failures if failure.get("id")]
+        metadata["skip_failure_ids"] = _ordered_unique(
+            [*list(metadata.get("skip_failure_ids") or []), *failure_ids]
+        )
         metadata["skip_commit_paths"] = commit_rel_paths
         metadata["skip_local_restored_paths"] = restored_paths
+        if failures or required_skip_keys:
+            metadata["skip_pr_url"] = pr_url
+            metadata["skip_pr_branch"] = skip_branch
         ctx.db.update_job(job_id, status="pr_created", metadata=metadata)
+        try:
+            ctx._write_job_artifacts(job_id, worktree, artifact_dir)
+        except Exception as artifact_exc:
+            emit("warn", f"PR was created, but refreshed local artifacts could not be written: {artifact_exc}")
     except Exception as exc:
         if full_generated_snapshots and restore_target_path is not None:
             try:
@@ -100,6 +167,91 @@ def run_skip_pr_job(ctx, job_id: str) -> None:
                 emit("error", f"Failed to restore full generated tests after skip PR staging: {restore_exc}")
         ctx.db.update_job(job_id, status="failed", error=str(exc))
         emit("error", str(exc))
+
+
+def _selected_manifest_tests(
+    manifest_tests: list[dict[str, str]],
+    selected_tests: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    requested: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in selected_tests:
+        if not isinstance(item, dict):
+            continue
+        key = (str(item.get("suite") or "").strip(), str(item.get("name") or "").strip())
+        if not key[0] or not key[1] or key in seen:
+            continue
+        seen.add(key)
+        requested.append(key)
+    if not requested:
+        raise RuntimeError("Select at least one generated test before creating a PR.")
+
+    by_key = {(item["suite"], item["name"]): item for item in manifest_tests}
+    missing = [f"{suite}.{name}" for suite, name in requested if (suite, name) not in by_key]
+    if missing:
+        raise RuntimeError("Only tests listed in .gme-agent/generated_tests.json can be submitted: " + ", ".join(missing))
+    return [by_key[key] for key in requested]
+
+
+def _classify_selected_tests(
+    selected_keys: set[tuple[str, str]],
+    open_failures: list[dict[str, Any]],
+    test_output: str,
+) -> tuple[set[tuple[str, str]], set[tuple[str, str]], list[dict[str, Any]]]:
+    failure_by_key = {
+        (str(item.get("test_suite") or ""), str(item.get("test_name") or "")): item
+        for item in open_failures
+    }
+    passing: set[tuple[str, str]] = set()
+    skipped: set[tuple[str, str]] = set()
+    selected_failures: list[dict[str, Any]] = []
+    unknown: list[str] = []
+    failed_without_record: list[str] = []
+    for key in sorted(selected_keys):
+        full_name = f"{key[0]}.{key[1]}"
+        failure = failure_by_key.get(key)
+        status = _gtest_test_status(test_output, full_name)
+        if failure is not None:
+            selected_failures.append(failure)
+        elif status == "OK":
+            passing.add(key)
+        elif status == "SKIPPED":
+            skipped.add(key)
+        elif status == "FAILED":
+            failed_without_record.append(full_name)
+        else:
+            unknown.append(full_name)
+    if failed_without_record:
+        raise RuntimeError(
+            "Selected failing tests have no current failure record; run the selected tests again first: "
+            + ", ".join(failed_without_record)
+        )
+    if unknown:
+        raise RuntimeError("Selected tests are unconfirmed; run them before creating a PR: " + ", ".join(unknown))
+    return passing, skipped, selected_failures
+
+
+def _submitted_test_names(job: dict[str, Any]) -> set[str]:
+    values = (job.get("metadata") or {}).get("submitted_test_names") or []
+    return {str(value) for value in values if str(value)}
+
+
+def _selected_pr_test_paths(selected_tests: list[dict[str, str]], target_path: Path) -> list[str]:
+    paths = _ordered_unique([normalize_repo_path(item["file"]) for item in selected_tests])
+    missing = [path for path in paths if not (target_path / path).is_file()]
+    if missing:
+        raise RuntimeError("Selected generated test files were not found: " + ", ".join(missing))
+    return paths
+
+
+def _ordered_unique(values: list[str]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if value and value not in seen:
+            seen.add(value)
+            result.append(value)
+    return result
 
 
 def _latest_open_failures_for_job(failures: list[dict[str, Any]], job_id: str) -> list[dict[str, Any]]:
@@ -230,6 +382,14 @@ def _skip_pr_branch_name(job: dict[str, Any]) -> str:
     return f"gme-agent/skip-{module}-{stamp}-{job_token}-{suffix}"
 
 
+def _selected_pr_branch_name(job: dict[str, Any]) -> str:
+    module = _branch_slug(str(job.get("module") or "generated"))
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    job_token = str(job.get("id") or "job")[:8]
+    suffix = uuid.uuid4().hex[:6]
+    return f"gme-agent/tests-{module}-{stamp}-{job_token}-{suffix}"
+
+
 def _branch_slug(value: str) -> str:
     slug = "".join(ch.lower() if ch.isalnum() else "-" for ch in value).strip("-")
     while "--" in slug:
@@ -319,21 +479,41 @@ def _prune_manifest_tests_to_failures(
     emit,
 ) -> None:
     keep_tests = {(str(failure.get("test_suite") or ""), str(failure.get("test_name") or "")) for failure in failures}
+    _prune_manifest_tests_to_selection(target_path, rel_paths, keep_tests, keep_tests, manifest_tests, emit)
+
+
+def _prune_manifest_tests_to_selection(
+    target_path: Path,
+    rel_paths: list[str],
+    selected_tests: set[tuple[str, str]],
+    required_skip_tests: set[tuple[str, str]],
+    manifest_tests: list[dict[str, str]],
+    emit,
+) -> None:
     manifest_by_path: dict[str, set[tuple[str, str]]] = {}
     for item in manifest_tests:
         manifest_by_path.setdefault(item["file"], set()).add((item["suite"], item["name"]))
 
+    found_selected: set[tuple[str, str]] = set()
     for rel_path in rel_paths:
         file_path = target_path / rel_path
         if not file_path.exists():
             raise RuntimeError(f"Generated test target file was not found: {rel_path}")
         generated_in_file = manifest_by_path.get(rel_path, set())
-        remove_tests = generated_in_file - keep_tests
+        selected_in_file = generated_in_file & selected_tests
+        remove_tests = generated_in_file - selected_tests
         text = file_path.read_text(encoding="utf-8", errors="replace")
         pruned = _remove_test_blocks(text, remove_tests, rel_path) if remove_tests else text
-        _require_skips_for_tests(pruned, generated_in_file & keep_tests, rel_path)
+        _require_tests_exist(pruned, selected_in_file, rel_path)
+        _require_skips_for_tests(pruned, selected_in_file & required_skip_tests, rel_path)
         file_path.write_text(pruned, encoding="utf-8")
-        emit("info", f"Prepared {rel_path} with {len(generated_in_file & keep_tests)} skipped failure test(s).")
+        found_selected.update(selected_in_file)
+        emit("info", f"Prepared {rel_path} with {len(selected_in_file)} selected generated test(s).")
+
+    missing = selected_tests - found_selected
+    if missing:
+        names = ", ".join(f"{suite}.{name}" for suite, name in sorted(missing))
+        raise RuntimeError(f"Could not map selected tests to PR files: {names}")
 
 
 def _failure_tests_by_generated_path(
@@ -407,6 +587,16 @@ def _require_skips_for_tests(text: str, keep_tests: set[tuple[str, str]], rel_pa
     if missing:
         names = ", ".join(f"{suite}.{name}" for suite, name in sorted(missing))
         raise RuntimeError(f"Could not find failure tests in {rel_path}: {names}")
+
+
+def _require_tests_exist(text: str, expected_tests: set[tuple[str, str]], rel_path: str) -> None:
+    if not expected_tests:
+        return
+    found = {(suite, name) for _start, _end, suite, name in _test_blocks(text, rel_path)}
+    missing = expected_tests - found
+    if missing:
+        names = ", ".join(f"{suite}.{name}" for suite, name in sorted(missing))
+        raise RuntimeError(f"Could not find selected tests in {rel_path}: {names}")
 
 
 _TEST_DECL_RE = re.compile(
@@ -533,20 +723,90 @@ def _failure_suite_filter(failures: list[dict[str, Any]]) -> str:
     return ":".join(tests) or "*"
 
 
+def _test_keys_filter(test_keys: set[tuple[str, str]]) -> str:
+    return ":".join(f"{suite}.{name}" for suite, name in sorted(test_keys)) or "*"
+
+
+def _gtest_test_status(output: str, full_name: str) -> str:
+    escaped = re.escape(full_name)
+    for status in ("FAILED", "SKIPPED", "OK"):
+        if re.search(rf"\[\s*{status}\s*\]\s+{escaped}(?:\s|$)", output or ""):
+            return status
+    return ""
+
+
+def _require_selected_tests_reported(output: str, selected_tests: set[tuple[str, str]]) -> None:
+    missing = [
+        f"{suite}.{name}"
+        for suite, name in sorted(selected_tests)
+        if not _gtest_test_status(output, f"{suite}.{name}")
+    ]
+    if missing:
+        raise RuntimeError("Selected tests did not appear in the verification output: " + ", ".join(missing))
+
+
+def _validate_selected_test_results(
+    output: str,
+    passing_tests: set[tuple[str, str]],
+    skipped_tests: set[tuple[str, str]],
+) -> None:
+    mismatches: list[str] = []
+    for suite, name in sorted(passing_tests):
+        full_name = f"{suite}.{name}"
+        status = _gtest_test_status(output, full_name)
+        if status != "OK":
+            mismatches.append(f"{full_name} expected OK, got {status or 'missing'}")
+    for suite, name in sorted(skipped_tests):
+        full_name = f"{suite}.{name}"
+        status = _gtest_test_status(output, full_name)
+        if status != "SKIPPED":
+            mismatches.append(f"{full_name} expected SKIPPED, got {status or 'missing'}")
+    if mismatches:
+        raise RuntimeError("Selected test verification did not match the expected result: " + "; ".join(mismatches))
+
+
 def _skip_pr_title(job: dict[str, Any]) -> str:
     module = str(job.get("module") or "generated").strip() or "generated"
     return f"feature({module}):gme agent test"
 
 
 def _skip_pr_body(job: dict[str, Any], failures: list[dict[str, Any]], gtest_filter: str) -> str:
-    lines = [
-        "该 PR 由 GME Test Agent 自动生成，新增 GME vs ACIS 对比测试，并对当前已确认存在差异的失败用例增加 skip。",
-        "",
-        "本次新增测试用例：",
+    tests = [
+        {
+            "suite": str(failure.get("test_suite") or ""),
+            "name": str(failure.get("test_name") or ""),
+        }
+        for failure in failures
     ]
-    for failure in failures:
-        lines.append(f"{failure.get('test_suite')}.{failure.get('test_name')}")
+    return _selected_pr_body(tests, failures)
+
+
+def _selected_pr_body(
+    selected_tests: list[dict[str, str]],
+    failures: list[dict[str, Any]],
+    *,
+    has_skips: bool = False,
+) -> str:
+    if failures or has_skips:
+        intro = "该 PR 由 GME Test Agent 自动生成，新增 GME vs ACIS 对比测试，并对当前已确认存在差异的失败用例增加 skip。"
+    else:
+        intro = "该 PR 由 GME Test Agent 自动生成，新增选中的 GME vs ACIS 对比测试。"
+    lines = [intro, "", "本次新增测试用例："]
+    lines.extend(f"{item.get('suite')}.{item.get('name')}" for item in selected_tests)
     return "\n".join(lines)
+
+
+def _latest_test_output(artifact_dir: Path) -> str:
+    candidates = [
+        artifact_dir / "gtest_output.txt",
+        artifact_dir / "gtest_output_after_skip.txt",
+        artifact_dir / "gtest_output_selected_pr.txt",
+    ]
+    existing = [path for path in candidates if path.exists()]
+    if not existing:
+        return ""
+    latest = max(existing, key=lambda path: path.stat().st_mtime_ns)
+    return _read_text(latest)
 
 
 def _read_text(path: Path) -> str:

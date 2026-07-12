@@ -87,6 +87,50 @@ def ensure_generated_tests_use_existing_files(worktree: str | Path, target_repo:
         )
 
 
+def ensure_generated_tests_use_selected_files(
+    manifest: dict[str, Any],
+    target_repo: str,
+    selected_files: list[str],
+    *,
+    previous_entries: set[tuple[str, str, str]] | None = None,
+) -> None:
+    allowed = {
+        normalized
+        for value in selected_files
+        if (normalized := _normalize_manifest_file(str(value or ""), target_repo))
+    }
+    if not allowed:
+        raise RuntimeError("Structured test generation has no valid selected target files")
+
+    unexpected: set[str] = set()
+    for test in manifest.get("tests") or []:
+        key = (
+            str(test.get("file") or ""),
+            str(test.get("suite") or ""),
+            str(test.get("name") or ""),
+        )
+        if previous_entries is not None and key in previous_entries:
+            continue
+        file_path = str(test.get("file") or "")
+        if file_path not in allowed:
+            unexpected.add(file_path or "<missing>")
+    if unexpected:
+        raise RuntimeError(
+            "Generated tests must stay in the selected target files: " + ", ".join(sorted(unexpected))
+        )
+
+
+def generated_test_entry_keys(manifest: dict[str, Any]) -> set[tuple[str, str, str]]:
+    return {
+        (
+            str(test.get("file") or ""),
+            str(test.get("suite") or ""),
+            str(test.get("name") or ""),
+        )
+        for test in manifest.get("tests") or []
+    }
+
+
 def generated_tests_manifest_path(worktree: str | Path) -> Path:
     return Path(worktree) / GENERATED_TESTS_MANIFEST
 

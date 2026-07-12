@@ -4,21 +4,23 @@ from pathlib import Path
 
 from ..git.diff import commit_all, create_pr, push_branch
 from ..git.worktree import remove_worktree
+from ..services.job_service import job_worktree_paths
 
 
 def run_cleanup_job(ctx, job_id: str) -> None:
     emit = ctx._job_emit(job_id)
     job = ctx.db.get_job(job_id)
-    path = job.get("worktree_path")
-    if not path:
+    paths = job_worktree_paths(ctx, job)
+    if not paths:
         emit("warn", "Job has no worktree to clean.")
         return
     try:
         ctx.db.update_job(job_id, status="cleaning_worktree")
-        remove_worktree(ctx.config, path, emit)
-        metadata = ctx._merge_metadata(job_id, {"cleaned_worktree_path": path})
+        for path in paths:
+            remove_worktree(ctx.config, path, emit)
+        metadata = ctx._merge_metadata(job_id, {"cleaned_worktree_path": str(paths[0]), "cleaned_worktree_paths": [str(path) for path in paths]})
         ctx.db.update_job(job_id, status="worktree_cleaned", worktree_path="", metadata=metadata)
-        emit("info", f"Removed worktree {path}")
+        emit("info", "Removed worktree " + ", ".join(str(path) for path in paths))
     except Exception as exc:
         ctx.db.update_job(job_id, status="failed", error=str(exc))
         emit("error", str(exc))

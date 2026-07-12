@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import uuid
 import shutil
+import re
 
 from ..execution.runner import merge_failures, parse_gtest_failures, parse_gtest_xml, run_template_command
 
@@ -97,12 +98,23 @@ def record_failures(ctx, job_id: str, test_output: str, gtest_filter: str, *, ar
     parsed = merge_failures(parse_gtest_xml(ctx._gtest_xml_path(artifact_dir)), parse_gtest_failures(test_output))
     failures = []
     job = ctx.db.get_job(job_id)
-    cleared = _clear_stale_open_failures(ctx, job_id, parsed, gtest_filter)
-    if cleared:
-        ctx._emit(job_id, "info", f"Cleared {cleared} stale open failure records.")
+    run_id = uuid.uuid4().hex
+    reported_outcomes = _reported_gtest_outcomes(test_output)
+    for (suite, test), status in reported_outcomes.items():
+        ctx.db.upsert_test_case_result(
+            job_id=job_id,
+            test_suite=suite,
+            test_name=test,
+            status=status,
+            run_id=run_id,
+            gtest_filter=gtest_filter,
+        )
+    resolved = _resolve_stale_open_failures(ctx, job_id, parsed, test_output, gtest_filter, run_id)
+    if resolved:
+        ctx._emit(job_id, "info", f"Resolved {resolved} stale open failure records.")
     for item in parsed:
         failure_id = f"gmefail-{uuid.uuid4().hex[:10]}"
-        failure = ctx.db.create_failure(
+        failure = ctx.db.upsert_failure(
             failure_id=failure_id,
             job_id=job_id,
             test_suite=str(item.get("test_suite") or ""),
@@ -114,16 +126,75 @@ def record_failures(ctx, job_id: str, test_output: str, gtest_filter: str, *, ar
             skip_id=failure_id,
             metadata={"gtest_filter": gtest_filter, "module": job.get("module") or "", "target_repo": ctx._job_target_repo(job)},
         )
+        ctx.db.add_failure_observation(
+            run_id=run_id,
+            failure_id=str(failure["id"]),
+            job_id=job_id,
+            outcome="failed",
+            test_suite=str(item.get("test_suite") or ""),
+            test_name=str(item.get("test_name") or ""),
+            file=str(item.get("file") or ""),
+            line=int(item.get("line") or 0),
+            reason=str(item.get("reason") or ""),
+            gtest_filter=gtest_filter,
+        )
         failures.append(failure)
-        ctx._emit(job_id, "warn", f"Recorded failure {failure_id}: {failure['test_suite']}.{failure['test_name']}")
+        ctx._emit(job_id, "warn", f"Observed failure {failure['id']}: {failure['test_suite']}.{failure['test_name']}")
     return failures
 
 
-def _clear_stale_open_failures(ctx, job_id: str, parsed: list[dict], gtest_filter: str) -> int:
-    if _is_broad_gtest_filter(gtest_filter):
-        return ctx.db.delete_open_failures_for_job(job_id)
-    test_keys = _failure_test_keys(parsed) or _specific_gtest_filter_keys(gtest_filter)
-    return ctx.db.delete_open_failures_for_tests(job_id, test_keys)
+def _resolve_stale_open_failures(
+    ctx,
+    job_id: str,
+    parsed: list[dict],
+    test_output: str,
+    gtest_filter: str,
+    run_id: str,
+) -> int:
+    failed_keys = set(_failure_test_keys(parsed))
+    scoped_keys = None if _is_broad_gtest_filter(gtest_filter) else set(_specific_gtest_filter_keys(gtest_filter))
+    reported_outcomes = _reported_gtest_outcomes(test_output)
+    resolved = 0
+    for failure in ctx.db.list_failures():
+        if failure.get("job_id") != job_id or failure.get("status") != "open":
+            continue
+        key = (str(failure.get("test_suite") or ""), str(failure.get("test_name") or ""))
+        if (
+            key in failed_keys
+            or (scoped_keys is not None and key not in scoped_keys)
+            or key not in reported_outcomes
+        ):
+            continue
+        ctx.db.update_failure(str(failure["id"]), status="resolved")
+        ctx.db.add_failure_observation(
+            run_id=run_id,
+            failure_id=str(failure["id"]),
+            job_id=job_id,
+            outcome=reported_outcomes[key],
+            test_suite=key[0],
+            test_name=key[1],
+            file=str(failure.get("file") or ""),
+            line=int(failure.get("line") or 0),
+            reason="The test was in scope and did not fail in this run.",
+            gtest_filter=gtest_filter,
+        )
+        resolved += 1
+    return resolved
+
+
+def _reported_gtest_outcomes(test_output: str) -> dict[tuple[str, str], str]:
+    outcomes: dict[tuple[str, str], str] = {}
+    pattern = re.compile(r"^\s*\[\s*(OK|SKIPPED|FAILED)\s*\]\s+([^\s]+)", re.MULTILINE)
+    for status, full_name in pattern.findall(test_output or ""):
+        if "." not in full_name:
+            continue
+        suite, test = full_name.rsplit(".", 1)
+        outcomes[(suite, test)] = {
+            "OK": "passed",
+            "SKIPPED": "skipped",
+            "FAILED": "failed",
+        }[status]
+    return outcomes
 
 
 def _failure_test_keys(items: list[dict]) -> list[tuple[str, str]]:

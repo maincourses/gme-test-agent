@@ -5,7 +5,7 @@ from typing import Any
 import threading
 import uuid
 
-from ..flows.bug_fix_flow import run_fix_job
+from ..flows.bug_fix_flow import run_fix_job, validate_fix_failure
 from ..flows.build_test_flow import (
     record_failures,
     run_build_job,
@@ -15,48 +15,141 @@ from ..flows.build_test_flow import (
 )
 from ..flows.generated_test_edit_flow import delete_generated_tests
 from ..flows.pr_flow import run_cleanup_job, run_pr_job
-from ..flows.skip_pr_flow import run_skip_pr_job
+from ..flows.skip_pr_flow import run_selected_tests_pr_job, run_skip_pr_job
 from ..flows.test_generation_flow import run_test_extension_job, run_test_generation_job
 from ..git.worktree import normalize_repo_path
 from ..settings.config import AgentConfig
 from ..storage.db import AgentDb
 from .artifact_service import artifact_dir_for_job, write_job_artifacts
 from .failure_service import failure_filter, update_failure_status
+from .interface_catalog_service import (
+    merge_selected_interfaces,
+    resolve_test_generation_selection,
+    selection_title,
+)
 from .job_service import delete_job_record
+
+
+class JobAlreadyActiveError(RuntimeError):
+    pass
+
+
+def _selection_metadata(selection: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "selected_interface_ids": selection["interface_ids"],
+        "selected_interfaces": selection["interfaces"],
+        "last_selected_interfaces": selection["interfaces"],
+        "selected_target_files": selection["target_files"],
+        "tests_per_interface": selection["tests_per_interface"],
+        "requested_test_count": selection["requested_test_count"],
+        "extra_requirements": selection["extra_requirements"],
+    }
 
 
 class Orchestrator:
     def __init__(self, config: AgentConfig, db: AgentDb):
         self.config = config
         self.db = db
+        self._active_jobs: set[str] = set()
+        self._active_jobs_lock = threading.RLock()
 
     def set_config(self, config: AgentConfig) -> None:
         self.config = config
 
-    def create_test_generation_job(self, module: str, api_name: str) -> dict[str, Any]:
+    def create_test_generation_job(
+        self,
+        module: str,
+        api_name: str = "",
+        *,
+        interface_ids: list[str] | None = None,
+        tests_per_interface: int = 1,
+        extra_requirements: str = "",
+    ) -> dict[str, Any]:
         job_id = str(uuid.uuid4())
         title = f"Generate {module} tests"
         target_repo = self._test_target_repo()
+        selection = None
+        if interface_ids is not None:
+            selection = resolve_test_generation_selection(
+                module,
+                interface_ids,
+                tests_per_interface,
+                extra_requirements,
+            )
+            api_name = selection_title(selection)
+        metadata = {"target_repo": target_repo, "pr_strategy": self.config.pr_strategy}
+        if selection:
+            metadata.update(_selection_metadata(selection))
         job = self.db.create_job(
             job_id=job_id,
             job_type="test_generation",
             title=title,
             module=module,
             api_name=api_name,
-            metadata={"target_repo": target_repo, "pr_strategy": self.config.pr_strategy},
+            metadata=metadata,
         )
-        self._start_thread(self._run_test_generation_job, job_id, module, api_name, target_repo)
-        return job
+        self._start_thread(
+            self._run_test_generation_job,
+            job_id,
+            module,
+            api_name,
+            target_repo,
+            selection,
+        )
+        return self.job_with_runtime_state(job_id)
 
-    def extend_test_generation_job(self, job_id: str, api_name: str) -> dict[str, Any]:
+    def extend_test_generation_job(
+        self,
+        job_id: str,
+        api_name: str = "",
+        *,
+        interface_ids: list[str] | None = None,
+        tests_per_interface: int = 1,
+        extra_requirements: str = "",
+    ) -> dict[str, Any]:
         job = self.db.get_job(job_id)
         if job.get("type") != "test_generation":
             raise ValueError("Only test-generation jobs can be extended.")
-        self._start_thread(self._run_test_extension_job, job_id, api_name)
-        return job
+        selection = None
+        if interface_ids is not None:
+            selection = resolve_test_generation_selection(
+                str(job.get("module") or ""),
+                interface_ids,
+                tests_per_interface,
+                extra_requirements,
+            )
+            api_name = selection_title(selection)
+            metadata = dict(job.get("metadata") or {})
+            metadata.update(_selection_metadata(selection))
+            metadata["selected_interfaces"] = merge_selected_interfaces(
+                (job.get("metadata") or {}).get("selected_interfaces") or [],
+                selection["interfaces"],
+            )
+            metadata["last_selected_interfaces"] = selection["interfaces"]
+            metadata["selected_interface_ids"] = [
+                item["id"] for item in metadata["selected_interfaces"]
+            ]
+            metadata["selected_target_files"] = list(
+                dict.fromkeys(
+                    [
+                        *((job.get("metadata") or {}).get("selected_target_files") or []),
+                        *selection["target_files"],
+                    ]
+                )
+            )
+        self._reserve_job(job_id)
+        try:
+            if selection is not None:
+                job = self.db.update_job(job_id, api_name=api_name, metadata=metadata)
+            self._start_reserved_thread(self._run_test_extension_job, job_id, api_name, selection)
+        except Exception:
+            self._release_job(job_id)
+            raise
+        return self.job_with_runtime_state(job_id)
 
     def create_fix_job(self, failure_id: str) -> dict[str, Any]:
         failure = self.db.get_failure(failure_id)
+        fix_context = validate_fix_failure(self, failure)
         source_job = self.db.get_job(failure["job_id"]) if failure.get("job_id") else {}
         module = str(source_job.get("module") or failure.get("metadata", {}).get("module") or "")
         target_repo = self._module_target_repo(module) if module else "."
@@ -67,51 +160,123 @@ class Orchestrator:
             title=f"Fix {failure_id}",
             module=module,
             api_name="",
-            metadata={"failure_id": failure_id, "target_repo": target_repo, "pr_strategy": self.config.pr_strategy},
+            metadata={
+                "failure_id": failure_id,
+                "target_repo": target_repo,
+                "pr_strategy": self.config.pr_strategy,
+                **fix_context,
+            },
         )
         failure_metadata = dict(failure.get("metadata") or {})
         failure_metadata["fix_job_id"] = job_id
         self.db.update_failure(failure_id, status="fixing", metadata=failure_metadata)
         self._start_thread(self._run_fix_job, job_id, failure)
-        return job
+        return self.job_with_runtime_state(job_id)
 
     def run_tests_for_job(self, job_id: str, gtest_filter: str = "*") -> dict[str, Any]:
-        job = self.db.get_job(job_id)
+        self.db.get_job(job_id)
         self._start_thread(self._run_tests_job, job_id, gtest_filter)
-        return job
+        return self.job_with_runtime_state(job_id)
 
     def build_job(self, job_id: str) -> dict[str, Any]:
-        job = self.db.get_job(job_id)
+        self.db.get_job(job_id)
         self._start_thread(self._run_build_job, job_id)
-        return job
+        return self.job_with_runtime_state(job_id)
 
     def create_pr_for_job(self, job_id: str) -> dict[str, Any]:
-        job = self.db.get_job(job_id)
+        self.db.get_job(job_id)
         self._start_thread(self._run_pr_job, job_id)
-        return job
+        return self.job_with_runtime_state(job_id)
 
     def create_skip_pr_for_job(self, job_id: str) -> dict[str, Any]:
-        job = self.db.get_job(job_id)
+        self.db.get_job(job_id)
         self._start_thread(self._run_skip_pr_job, job_id)
-        return job
+        return self.job_with_runtime_state(job_id)
+
+    def create_selected_tests_pr_for_job(self, job_id: str, tests: list[dict[str, str]]) -> dict[str, Any]:
+        job = self.db.get_job(job_id)
+        if job.get("type") != "test_generation":
+            raise RuntimeError("Only test-generation jobs can submit selected tests.")
+        if not tests:
+            raise RuntimeError("Select at least one generated test before creating a PR.")
+        self._start_thread(self._run_selected_tests_pr_job, job_id, tests)
+        return self.job_with_runtime_state(job_id)
 
     def cleanup_job_worktree(self, job_id: str) -> dict[str, Any]:
-        job = self.db.get_job(job_id)
+        self.db.get_job(job_id)
         self._start_thread(self._run_cleanup_job, job_id)
-        return job
+        return self.job_with_runtime_state(job_id)
 
     def delete_job(self, job_id: str, *, cleanup_worktree: bool = True, delete_artifacts: bool = True) -> dict[str, Any]:
-        return delete_job_record(self, job_id, cleanup_worktree=cleanup_worktree, delete_artifacts=delete_artifacts)
+        return self._run_exclusive_job_action(
+            job_id,
+            delete_job_record,
+            self,
+            job_id,
+            cleanup_worktree=cleanup_worktree,
+            delete_artifacts=delete_artifacts,
+        )
 
     def delete_generated_tests_for_job(self, job_id: str, tests: list[dict[str, str]]) -> dict[str, Any]:
-        return delete_generated_tests(self, job_id, tests)
+        return self._run_exclusive_job_action(job_id, delete_generated_tests, self, job_id, tests)
 
     def update_failure_status(self, failure_id: str, status: str) -> dict[str, Any]:
         return update_failure_status(self.db, failure_id, status)
 
+    def _reserve_job(self, job_id: str) -> None:
+        with self._active_jobs_lock:
+            if job_id in self._active_jobs:
+                raise JobAlreadyActiveError(f"Job {job_id} is already running another action.")
+            self._active_jobs.add(job_id)
+
+    def _release_job(self, job_id: str) -> None:
+        with self._active_jobs_lock:
+            self._active_jobs.discard(job_id)
+
     def _start_thread(self, target, *args) -> None:
-        thread = threading.Thread(target=target, args=args, daemon=True)
+        job_id = str(args[0]) if args else ""
+        if job_id:
+            self._reserve_job(job_id)
+        try:
+            self._start_reserved_thread(target, *args)
+        except Exception:
+            if job_id:
+                self._release_job(job_id)
+            raise
+
+    def _start_reserved_thread(self, target, *args) -> None:
+        job_id = str(args[0]) if args else ""
+
+        def run_target() -> None:
+            try:
+                target(*args)
+            finally:
+                if job_id:
+                    self._release_job(job_id)
+
+        thread = threading.Thread(target=run_target, daemon=True)
         thread.start()
+
+    def _run_exclusive_job_action(self, job_id: str, target, *args, **kwargs):
+        self._reserve_job(job_id)
+        try:
+            return target(*args, **kwargs)
+        finally:
+            self._release_job(job_id)
+
+    def is_job_active(self, job_id: str) -> bool:
+        with self._active_jobs_lock:
+            return job_id in self._active_jobs
+
+    def job_with_runtime_state(self, job_id: str) -> dict[str, Any]:
+        job = self.db.get_job(job_id)
+        return {**job, "active": self.is_job_active(job_id)}
+
+    def list_jobs_with_runtime_state(self) -> list[dict[str, Any]]:
+        return [
+            {**job, "active": self.is_job_active(str(job.get("id") or ""))}
+            for job in self.db.list_jobs()
+        ]
 
     def _emit(self, job_id: str, level: str, message: str) -> None:
         self.db.add_event(job_id, level, message)
@@ -119,11 +284,23 @@ class Orchestrator:
     def _job_emit(self, job_id: str):
         return lambda level, message: self._emit(job_id, level, message)
 
-    def _run_test_generation_job(self, job_id: str, module: str, api_name: str, target_repo: str) -> None:
-        run_test_generation_job(self, job_id, module, api_name, target_repo)
+    def _run_test_generation_job(
+        self,
+        job_id: str,
+        module: str,
+        api_name: str,
+        target_repo: str,
+        selection: dict[str, Any] | None,
+    ) -> None:
+        run_test_generation_job(self, job_id, module, api_name, target_repo, selection)
 
-    def _run_test_extension_job(self, job_id: str, api_name: str) -> None:
-        run_test_extension_job(self, job_id, api_name)
+    def _run_test_extension_job(
+        self,
+        job_id: str,
+        api_name: str,
+        selection: dict[str, Any] | None,
+    ) -> None:
+        run_test_extension_job(self, job_id, api_name, selection)
 
     def _run_fix_job(self, job_id: str, failure: dict[str, Any]) -> None:
         run_fix_job(self, job_id, failure)
@@ -142,6 +319,9 @@ class Orchestrator:
 
     def _run_skip_pr_job(self, job_id: str) -> None:
         run_skip_pr_job(self, job_id)
+
+    def _run_selected_tests_pr_job(self, job_id: str, tests: list[dict[str, str]]) -> None:
+        run_selected_tests_pr_job(self, job_id, tests)
 
     def _run_configure_and_build(self, job_id: str, worktree: Path) -> str:
         return run_configure_and_build(self, job_id, worktree)

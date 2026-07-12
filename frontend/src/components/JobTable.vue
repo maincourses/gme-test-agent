@@ -3,7 +3,7 @@ import { Clipboard } from "@lucide/vue";
 import { jobTypeLabels, useWorkspace } from "../composables/useWorkspace";
 
 const {
-  jobs,
+  testJobs,
   selectedJob,
   selectedJobId,
   selectJob,
@@ -17,7 +17,7 @@ const {
 <template>
   <section class="panel table-panel">
     <div class="panel-title-row">
-      <h2>任务</h2>
+      <h2>测试任务</h2>
       <button class="ghost-button compact" type="button" @click="copyText(selectedJob?.worktree_path || '')">
         <Clipboard :size="15" />
         复制工作区
@@ -39,7 +39,7 @@ const {
         </thead>
         <tbody>
           <tr
-            v-for="job in jobs"
+            v-for="job in testJobs"
             :key="job.id"
             :class="{ selected: selectedJobId === job.id }"
             @click="selectJob(job.id)"
@@ -53,7 +53,7 @@ const {
             <td class="truncate">{{ job.api_name }}</td>
             <td>{{ job.updated_at }}</td>
           </tr>
-          <tr v-if="!jobs.length">
+          <tr v-if="!testJobs.length">
             <td colspan="8" class="empty-cell">暂无任务</td>
           </tr>
         </tbody>

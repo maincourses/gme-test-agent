@@ -12,13 +12,26 @@ $LogDir = Join-Path $Root "logs"
 $BackendOutLog = Join-Path $LogDir "web-backend.out.log"
 $BackendErrLog = Join-Path $LogDir "web-backend.err.log"
 $HealthUrl = "http://127.0.0.1:$BackendPort/api/health"
+$TokenPath = Join-Path $LogDir "web-api-token.log"
 
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
+$ApiToken = if (Test-Path $TokenPath) { (Get-Content -LiteralPath $TokenPath -Raw).Trim() } else { "" }
+if ($ApiToken.Length -lt 32) {
+    $TokenBytes = New-Object byte[] 32
+    $TokenGenerator = [System.Security.Cryptography.RandomNumberGenerator]::Create()
+    $TokenGenerator.GetBytes($TokenBytes)
+    $TokenGenerator.Dispose()
+    $ApiToken = -join ($TokenBytes | ForEach-Object { $_.ToString("x2") })
+    Set-Content -LiteralPath $TokenPath -Value $ApiToken -NoNewline
+}
+$AuthHeaders = @{ Authorization = "Bearer $ApiToken" }
+
 function Test-BackendReady {
     try {
-        $response = Invoke-WebRequest -UseBasicParsing -Uri $HealthUrl -TimeoutSec 2
-        return $response.StatusCode -eq 200
+        $response = Invoke-WebRequest -UseBasicParsing -Uri $HealthUrl -Headers $AuthHeaders -TimeoutSec 2
+        $data = $response.Content | ConvertFrom-Json
+        return $response.StatusCode -eq 200 -and $data.authenticated -eq $true
     } catch {
         return $false
     }
@@ -52,7 +65,9 @@ if (-not (Test-BackendReady)) {
             "-CondaEnv",
             $CondaEnv,
             "-Port",
-            $BackendPort
+            $BackendPort,
+            "-ApiToken",
+            $ApiToken
         )
 
     $deadline = (Get-Date).AddSeconds(45)
@@ -76,4 +91,4 @@ if (-not (Test-BackendReady)) {
     Write-Host "Python backend is already running on $HealthUrl."
 }
 
-& $FrontendScript -Port $FrontendPort
+& $FrontendScript -Port $FrontendPort -BackendPort $BackendPort -ApiToken $ApiToken

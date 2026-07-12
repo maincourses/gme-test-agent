@@ -1,9 +1,16 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 import tempfile
+import threading
+import time
 import unittest
+import urllib.error
+import urllib.request
 from unittest import mock
 from pathlib import Path
+from typing import Any
 import sys
 import subprocess
 
@@ -21,25 +28,36 @@ from gme_agent.git.repositories import (
 from gme_agent.git.worktree import normalize_repo_path
 from gme_agent.execution.runner import merge_failures, parse_gtest_failures, parse_gtest_xml
 from gme_agent.flows.skip_pr_flow import (
+    _classify_selected_tests,
     _failure_suite_filter,
     _format_generated_tests,
     _prune_manifest_tests_to_failures,
+    _prune_manifest_tests_to_selection,
     _prune_generated_test_text,
+    _require_selected_tests_reported,
     _restore_generated_tests,
+    _selected_manifest_tests,
+    _selected_pr_body,
+    _selected_pr_branch_name,
     _skip_pr_branch_name,
     _skip_pr_body,
     _skip_pr_title,
     _snapshot_generated_tests,
+    _validate_selected_test_results,
 )
 from gme_agent.flows.generated_test_edit_flow import delete_generated_tests
+from gme_agent.flows.build_test_flow import record_failures
+from gme_agent.flows.bug_fix_flow import _gtest_status, validate_fix_failure
 from gme_agent.generated_tests import (
+    ensure_generated_tests_use_selected_files,
     ensure_generated_tests_use_existing_files,
     load_generated_tests_manifest,
     require_generated_tests_manifest,
 )
-from gme_agent.services.orchestrator import Orchestrator
-from gme_agent.api.server import _match_job_action
+from gme_agent.services.orchestrator import JobAlreadyActiveError, Orchestrator
+from gme_agent.api.server import _match_job_action, create_server
 from gme_agent.prompts import (
+    bug_fix_prompt,
     continue_test_generation_prompt,
     skip_known_failure_prompt,
     test_generation_prompt,
@@ -82,6 +100,67 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(loaded.test_generation_skill, "gme-test-generation")
             self.assertEqual(loaded.bug_fix_skill, "gme-bug-fix")
 
+    def test_api_requires_runtime_token_and_restricts_browser_origins(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.json"
+            save_config(
+                config_path,
+                AgentConfig(
+                    gme_repo_path=str(root / "gme"),
+                    worktree_root=str(root / "worktrees"),
+                    artifact_root=str(root / "artifacts"),
+                    database_path=str(root / "agent.db"),
+                ),
+            )
+            token = "a" * 64
+            server = create_server(config_path, "127.0.0.1", 0, token)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            base_url = f"http://127.0.0.1:{server.server_address[1]}/api/health"
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+            def status(headers: dict[str, str] | None = None, *, method: str = "GET") -> tuple[int, dict, Any]:
+                request = urllib.request.Request(base_url, headers=headers or {}, method=method)
+                try:
+                    response = opener.open(request, timeout=5)
+                    return response.status, json.loads(response.read().decode("utf-8")), response.headers
+                except urllib.error.HTTPError as exc:
+                    return exc.code, json.loads(exc.read().decode("utf-8")), exc.headers
+
+            try:
+                self.assertEqual(status()[0], 401)
+                self.assertEqual(status({"Authorization": "Bearer wrong-token"})[0], 401)
+                self.assertEqual(
+                    status(
+                        {
+                            "Authorization": f"Bearer {token}",
+                            "Origin": "https://malicious.example",
+                        }
+                    )[0],
+                    403,
+                )
+
+                code, data, headers = status(
+                    {
+                        "Authorization": f"Bearer {token}",
+                        "Origin": "http://127.0.0.1:5173",
+                    }
+                )
+                self.assertEqual(code, 200)
+                self.assertTrue(data["authenticated"])
+                self.assertEqual(headers.get("Access-Control-Allow-Origin"), "http://127.0.0.1:5173")
+                self.assertNotEqual(headers.get("Access-Control-Allow-Origin"), "*")
+
+                code, _, headers = status({"Origin": "null"}, method="OPTIONS")
+                self.assertEqual(code, 200)
+                self.assertIn("Authorization", headers.get("Access-Control-Allow-Headers", ""))
+            finally:
+                server.shutdown()
+                thread.join(timeout=5)
+                server.server_close()
+                server.agent_state.db.close()  # type: ignore[attr-defined]
+
     def test_db_job_and_event(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = AgentDb(Path(tmp) / "agent.db")
@@ -100,16 +179,301 @@ class CoreTests(unittest.TestCase):
                 job = db.create_job(job_id="job-1", job_type="test_generation", title="Generate tests")
                 db.add_event(job["id"], "info", "hello")
                 db.create_failure(failure_id="failure-1", job_id=job["id"], test_suite="Suite", test_name="Case")
+                db.upsert_test_case_result(
+                    job_id=job["id"],
+                    test_suite="Suite",
+                    test_name="Case",
+                    status="passed",
+                    run_id="run-1",
+                )
 
                 deleted = db.delete_job(job["id"])
 
                 self.assertEqual(deleted["jobs"], 1)
                 self.assertEqual(deleted["events"], 1)
                 self.assertEqual(deleted["failures"], 1)
+                self.assertEqual(deleted["test_case_results"], 1)
                 with self.assertRaises(KeyError):
                     db.get_job(job["id"])
                 self.assertEqual(db.list_events(job["id"]), [])
                 self.assertEqual(db.list_failures(), [])
+            finally:
+                db.close()
+
+    def test_delete_stale_running_job_discovers_unrecorded_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree_root = root / "worktrees"
+            worktree = worktree_root / "testgen-base-20260708-181048-e477f65e"
+            worktree.mkdir(parents=True)
+            cfg = AgentConfig(
+                gme_repo_path=str(root / "gme"),
+                worktree_root=str(worktree_root),
+                artifact_root=str(root / "artifacts"),
+                database_path=str(root / "agent.db"),
+            )
+            db = AgentDb(cfg.database_path)
+            try:
+                job_id = "e477f65e-01ff-4f7e-99ae-bd2b0f12f082"
+                db.create_job(job_id=job_id, job_type="test_generation", title="Generate base tests", module="base")
+                db.update_job(job_id, status="creating_worktree")
+                orchestrator = Orchestrator(cfg, db)
+
+                with mock.patch("gme_agent.services.job_service.remove_worktree") as remove:
+                    result = orchestrator.delete_job(job_id)
+
+                remove.assert_called_once()
+                self.assertEqual(Path(remove.call_args.args[1]).resolve(), worktree.resolve())
+                self.assertTrue(result["deleted_worktree"])
+                self.assertEqual(result["deleted_rows"]["jobs"], 1)
+                with self.assertRaises(KeyError):
+                    db.get_job(job_id)
+            finally:
+                db.close()
+
+    def test_delete_active_running_job_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = AgentConfig(database_path=str(Path(tmp) / "agent.db"))
+            db = AgentDb(cfg.database_path)
+            try:
+                job_id = "job-active"
+                db.create_job(job_id=job_id, job_type="test_generation", title="Generate tests")
+                db.update_job(job_id, status="creating_worktree")
+                orchestrator = Orchestrator(cfg, db)
+                with orchestrator._active_jobs_lock:
+                    orchestrator._active_jobs.add(job_id)
+
+                with self.assertRaisesRegex(JobAlreadyActiveError, "already running another action"):
+                    orchestrator.delete_job(job_id)
+            finally:
+                db.close()
+
+    def test_job_actions_are_mutually_exclusive_until_background_thread_finishes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = AgentConfig(database_path=str(Path(tmp) / "agent.db"))
+            db = AgentDb(cfg.database_path)
+            started = threading.Event()
+            release = threading.Event()
+            try:
+                job_id = "job-exclusive"
+                db.create_job(job_id=job_id, job_type="test_generation", title="Generate tests")
+                orchestrator = Orchestrator(cfg, db)
+
+                def blocking_build(_job_id: str) -> None:
+                    started.set()
+                    release.wait(timeout=5)
+
+                with mock.patch.object(orchestrator, "_run_build_job", side_effect=blocking_build):
+                    response = orchestrator.build_job(job_id)
+                    self.assertTrue(started.wait(timeout=2))
+                    self.assertTrue(response["active"])
+                    self.assertTrue(orchestrator.is_job_active(job_id))
+
+                    with self.assertRaises(JobAlreadyActiveError):
+                        orchestrator.run_tests_for_job(job_id)
+                    with self.assertRaises(JobAlreadyActiveError):
+                        orchestrator.cleanup_job_worktree(job_id)
+                    with self.assertRaises(JobAlreadyActiveError):
+                        orchestrator.delete_generated_tests_for_job(job_id, [{"suite": "Suite", "name": "Case"}])
+                    with self.assertRaises(JobAlreadyActiveError):
+                        orchestrator.delete_job(job_id)
+
+                    release.set()
+                    deadline = time.time() + 2
+                    while orchestrator.is_job_active(job_id) and time.time() < deadline:
+                        time.sleep(0.01)
+                    self.assertFalse(orchestrator.is_job_active(job_id))
+            finally:
+                release.set()
+                db.close()
+
+    def test_record_failures_keeps_stable_id_status_and_observation_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = AgentConfig(
+                artifact_root=str(root / "artifacts"),
+                database_path=str(root / "agent.db"),
+                test_target_repo="tests/gme",
+            )
+            db = AgentDb(cfg.database_path)
+            try:
+                job = db.create_job(
+                    job_id="job-1",
+                    job_type="test_generation",
+                    title="Generate laws tests",
+                    module="laws",
+                    metadata={"target_repo": "tests/gme"},
+                )
+                orchestrator = Orchestrator(cfg, db)
+                artifact_dir = orchestrator._artifact_dir(job["id"])
+                output = """
+D:/repo/tests/gme/src/laws/law_base_test.cpp:42: Failure
+Expected equality of these values:
+[  FAILED  ] Laws_BaseTest.GeneratedCase (1 ms)
+"""
+
+                first = record_failures(orchestrator, job["id"], output, "Laws_BaseTest.GeneratedCase", artifact_dir=artifact_dir)
+                db.update_failure(first[0]["id"], status="fix_ready", metadata={"fix_job_id": "fix-1"})
+                second = record_failures(orchestrator, job["id"], output, "Laws_BaseTest.GeneratedCase", artifact_dir=artifact_dir)
+
+                self.assertEqual(second[0]["id"], first[0]["id"])
+                self.assertEqual(second[0]["status"], "fix_ready")
+                self.assertEqual(second[0]["metadata"]["fix_job_id"], "fix-1")
+                observations = db.list_failure_observations(first[0]["id"])
+                self.assertEqual(len(observations), 2)
+                self.assertEqual({item["outcome"] for item in observations}, {"failed"})
+                self.assertEqual(len({item["run_id"] for item in observations}), 2)
+            finally:
+                db.close()
+
+    def test_record_failures_resolves_only_open_tests_reported_as_not_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = AgentConfig(
+                artifact_root=str(root / "artifacts"),
+                database_path=str(root / "agent.db"),
+                test_target_repo="tests/gme",
+            )
+            db = AgentDb(cfg.database_path)
+            try:
+                job = db.create_job(
+                    job_id="job-1",
+                    job_type="test_generation",
+                    title="Generate laws tests",
+                    module="laws",
+                    metadata={"target_repo": "tests/gme"},
+                )
+                orchestrator = Orchestrator(cfg, db)
+                artifact_dir = orchestrator._artifact_dir(job["id"])
+                failed_output = """
+D:/repo/tests/gme/src/laws/law_base_test.cpp:42: Failure
+[  FAILED  ] Suite.Case (1 ms)
+"""
+                failure = record_failures(orchestrator, job["id"], failed_output, "Suite.Case", artifact_dir=artifact_dir)[0]
+
+                record_failures(orchestrator, job["id"], "[       OK ] Suite.Case (1 ms)", "Suite.Case", artifact_dir=artifact_dir)
+                self.assertEqual(db.get_failure(failure["id"])["status"], "resolved")
+                self.assertEqual(
+                    {item["outcome"] for item in db.list_failure_observations(failure["id"])},
+                    {"failed", "passed"},
+                )
+
+                reopened = record_failures(orchestrator, job["id"], failed_output, "Suite.Case", artifact_dir=artifact_dir)[0]
+                self.assertEqual(reopened["id"], failure["id"])
+                self.assertEqual(reopened["status"], "open")
+                record_failures(orchestrator, job["id"], "test executable was not found", "Suite.Case", artifact_dir=artifact_dir)
+                self.assertEqual(db.get_failure(failure["id"])["status"], "open")
+            finally:
+                db.close()
+
+    def test_partial_test_run_updates_only_reported_test_case_results(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            cfg = AgentConfig(
+                artifact_root=str(root / "artifacts"),
+                database_path=str(root / "agent.db"),
+                test_target_repo="tests/gme",
+            )
+            db = AgentDb(cfg.database_path)
+            try:
+                job = db.create_job(
+                    job_id="job-1",
+                    job_type="test_generation",
+                    title="Generate laws tests",
+                    module="laws",
+                    metadata={"target_repo": "tests/gme"},
+                )
+                orchestrator = Orchestrator(cfg, db)
+                artifact_dir = orchestrator._artifact_dir(job["id"])
+
+                record_failures(
+                    orchestrator,
+                    job["id"],
+                    "[       OK ] Suite.CaseA (1 ms)\n[       OK ] Suite.CaseB (1 ms)",
+                    "Suite.*",
+                    artifact_dir=artifact_dir,
+                )
+                initial = {
+                    (item["test_suite"], item["test_name"]): item["status"]
+                    for item in db.list_test_case_results(job["id"])
+                }
+                self.assertEqual(initial, {("Suite", "CaseA"): "passed", ("Suite", "CaseB"): "passed"})
+
+                record_failures(
+                    orchestrator,
+                    job["id"],
+                    "D:/repo/case.cpp:42: Failure\n[  FAILED  ] Suite.CaseA (1 ms)",
+                    "Suite.CaseA",
+                    artifact_dir=artifact_dir,
+                )
+                partial = {
+                    (item["test_suite"], item["test_name"]): item["status"]
+                    for item in db.list_test_case_results(job["id"])
+                }
+                self.assertEqual(partial, {("Suite", "CaseA"): "failed", ("Suite", "CaseB"): "passed"})
+            finally:
+                db.close()
+
+    def test_db_migration_merges_duplicate_failure_identity_and_rewrites_job_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "legacy.db"
+            conn = sqlite3.connect(path)
+            conn.executescript(
+                """
+                create table jobs (
+                    id text primary key, type text not null, status text not null, title text not null,
+                    module text, api_name text, branch text, worktree_path text, codex_thread_id text,
+                    created_at text not null, updated_at text not null,
+                    metadata_json text not null default '{}', error text
+                );
+                create table events (
+                    id integer primary key autoincrement, job_id text not null, ts text not null,
+                    level text not null, message text not null
+                );
+                create table failures (
+                    id text primary key, job_id text not null, status text not null,
+                    test_suite text, test_name text, file text, line integer, reason text,
+                    reproduce_command text, skip_id text, created_at text not null,
+                    updated_at text not null, metadata_json text not null default '{}'
+                );
+                """
+            )
+            conn.execute(
+                "insert into jobs values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "job-1", "test_generation", "needs_review", "Generate tests", "laws", "", "", "", "",
+                    "2026-07-08T10:00:00+0800", "2026-07-11T10:00:00+0800",
+                    json.dumps({"skip_failure_ids": ["failure-open"]}), None,
+                ),
+            )
+            conn.execute(
+                "insert into failures values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "failure-fix", "job-1", "fix_ready", "Suite", "Case", "old.cpp", 10, "old",
+                    "old command", "failure-fix", "2026-07-08T10:00:00+0800", "2026-07-08T11:00:00+0800",
+                    json.dumps({"fix_job_id": "fix-1"}),
+                ),
+            )
+            conn.execute(
+                "insert into failures values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "failure-open", "job-1", "open", "Suite", "Case", "new.cpp", 20, "latest",
+                    "new command", "failure-open", "2026-07-11T10:00:00+0800", "2026-07-11T10:00:00+0800",
+                    "{}",
+                ),
+            )
+            conn.commit()
+            conn.close()
+
+            db = AgentDb(path)
+            try:
+                failures = db.list_failures()
+                self.assertEqual(len(failures), 1)
+                self.assertEqual(failures[0]["id"], "failure-fix")
+                self.assertEqual(failures[0]["status"], "fix_ready")
+                self.assertEqual(failures[0]["reason"], "latest")
+                self.assertEqual(failures[0]["metadata"]["fix_job_id"], "fix-1")
+                self.assertEqual(db.get_job("job-1")["metadata"]["skip_failure_ids"], ["failure-fix"])
             finally:
                 db.close()
 
@@ -133,6 +497,7 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(_match_job_action("/api/jobs/job-1/delete", "delete"), "job-1")
         self.assertEqual(_match_job_action("/api/jobs/job-1/generated-tests/delete", "delete"), "")
         self.assertEqual(_match_job_action("/api/jobs/job-1/generated-tests/remove", "generated-tests", "remove"), "job-1")
+        self.assertEqual(_match_job_action("/api/jobs/job-1/selected-tests-pr", "selected-tests-pr"), "job-1")
 
     def test_delete_generated_tests_updates_files_manifest_metadata_and_failures(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -198,6 +563,12 @@ TEST_F(Suite, GeneratedB) {
                 )
                 db.create_failure(failure_id="failure-a", job_id=job["id"], test_suite="Suite", test_name="GeneratedA")
                 db.create_failure(failure_id="failure-b", job_id=job["id"], test_suite="Suite", test_name="GeneratedB")
+                db.upsert_test_case_result(
+                    job_id=job["id"], test_suite="Suite", test_name="GeneratedA", status="passed", run_id="run-1"
+                )
+                db.upsert_test_case_result(
+                    job_id=job["id"], test_suite="Suite", test_name="GeneratedB", status="failed", run_id="run-1"
+                )
                 orchestrator = Orchestrator(cfg, db)
 
                 updated = delete_generated_tests(orchestrator, job["id"], [{"suite": "Suite", "name": "GeneratedA"}])
@@ -211,6 +582,10 @@ TEST_F(Suite, GeneratedB) {
                 self.assertEqual([(test["suite"], test["name"]) for test in manifest["tests"]], [("Suite", "GeneratedB")])
                 self.assertEqual(updated["metadata"]["generated_gtest_filter"], "Suite.GeneratedB")
                 self.assertEqual([failure["id"] for failure in db.list_failures()], ["failure-b"])
+                self.assertEqual(
+                    [(item["test_suite"], item["test_name"], item["status"]) for item in db.list_test_case_results(job["id"])],
+                    [("Suite", "GeneratedB", "failed")],
+                )
                 self.assertTrue((Path(cfg.artifact_root) / job["id"] / "diff.patch").exists())
             finally:
                 db.close()
@@ -274,59 +649,158 @@ TEST_F(Suite, GeneratedB) {
 
         self.assertIn("GTEST_SKIP()", prompt)
         self.assertIn("[gme-agent-known-failure:<id>]", prompt)
+        self.assertIn("只能修改 `tests/gme`", prompt)
+        self.assertIn("需要标记的失败测试", prompt)
         self.assertNotIn("GME_AGENT_KNOWN_FAILURE", prompt)
         self.assertNotIn("gme_agent_known_failure.hxx", prompt)
+        self.assertNotIn("Failures to mark", prompt)
+
+    def test_bug_fix_prompt_forbids_test_and_include_changes(self) -> None:
+        prompt = bug_fix_prompt(
+            {"id": "gmefail-1", "test_suite": "Suite", "test_name": "Case", "reason": "mismatch"},
+            "module/laws",
+            test_repo="tests/gme",
+            test_file="tests/gme/src/laws/foo_test.cpp",
+            gtest_filter="Suite.Case",
+            before_output="[  FAILED  ] Suite.Case",
+        )
+
+        self.assertIn("生产代码只能修改 `module/laws`", prompt)
+        self.assertIn("不要修改 `include/`", prompt)
+        self.assertIn("不要修改 `tests/gme`", prompt)
+        self.assertIn("不要添加 `GTEST_SKIP`", prompt)
+        self.assertIn("只运行给定的准确 GTest filter", prompt)
+        self.assertNotIn("You are working in the GME repository", prompt)
+
+    def test_validate_fix_failure_requires_generated_open_unskipped_test(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            worktree = root / "worktree"
+            target = worktree / "tests" / "gme"
+            rel_path = "src/laws/foo_test.cpp"
+            (target / "src" / "laws").mkdir(parents=True)
+            (target / rel_path).write_text(
+                """#include "gtest/gtest.h"
+
+TEST_F(Suite, Case) {
+    EXPECT_TRUE(false);
+}
+""",
+                encoding="utf-8",
+            )
+            notes = worktree / ".gme-agent"
+            notes.mkdir(parents=True)
+            (notes / "generated_tests.json").write_text(
+                """
+{
+  "tests": [
+    {"file": "src/laws/foo_test.cpp", "suite": "Suite", "name": "Case"}
+  ]
+}
+""",
+                encoding="utf-8",
+            )
+            cfg = AgentConfig(
+                artifact_root=str(root / "artifacts"),
+                database_path=str(root / "agent.db"),
+                test_target_repo="tests/gme",
+            )
+            db = AgentDb(cfg.database_path)
+            try:
+                job = db.create_job(
+                    job_id="job-1",
+                    job_type="test_generation",
+                    title="Generate laws tests",
+                    module="laws",
+                    metadata={"target_repo": "tests/gme"},
+                )
+                db.update_job(job["id"], worktree_path=str(worktree))
+                failure = db.create_failure(failure_id="failure-1", job_id=job["id"], test_suite="Suite", test_name="Case")
+                orchestrator = Orchestrator(cfg, db)
+
+                context = validate_fix_failure(orchestrator, failure)
+
+                self.assertEqual(context["generated_test_file"], rel_path)
+                self.assertEqual(context["gtest_filter"], "Suite.Case")
+
+                (target / rel_path).write_text(
+                    """#include "gtest/gtest.h"
+
+TEST_F(Suite, Case) {
+    GTEST_SKIP() << "already skipped";
+    EXPECT_TRUE(false);
+}
+""",
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(RuntimeError, "GTEST_SKIP"):
+                    validate_fix_failure(orchestrator, failure)
+            finally:
+                db.close()
+
+    def test_gtest_status_reads_exact_selected_test(self) -> None:
+        output = """
+[       OK ] Suite.Pass (1 ms)
+[  SKIPPED ] Suite.Skip (0 ms)
+[  FAILED  ] Suite.Fail (1 ms)
+"""
+        self.assertEqual(_gtest_status(output, "Suite.Pass"), "OK")
+        self.assertEqual(_gtest_status(output, "Suite.Skip"), "SKIPPED")
+        self.assertEqual(_gtest_status(output, "Suite.Fail"), "FAILED")
+        self.assertEqual(_gtest_status(output, "Suite.Missing"), "")
 
     def test_test_generation_prompt_uses_existing_files_manifest_and_no_helpers(self) -> None:
         prompt = test_generation_prompt("laws", "api_ndifferentiate_law", "tests/gme")
 
         self.assertIn(".gme-agent/generated_tests.json", prompt)
-        self.assertIn("most relevant existing `.cpp`", prompt)
-        self.assertIn("Do not create `gme_agent_<module>_generated_test.cpp`", prompt)
-        self.assertIn("Do not add new helper functions", prompt)
-        self.assertIn("directly inside each individual `TEST_F` body", prompt)
-        self.assertIn("Write generated tests as `TEST_F` cases", prompt)
-        self.assertIn("delete any temporary files outside", prompt)
+        self.assertIn("职责最匹配的现有 `.cpp`", prompt)
+        self.assertIn("不要创建 `gme_agent_<module>_generated_test.cpp`", prompt)
+        self.assertIn("不要新增 helper 函数", prompt)
+        self.assertIn("必须直接写在各自的 `TEST_F` 函数体内", prompt)
+        self.assertIn("生成的测试必须使用 `TEST_F`", prompt)
+        self.assertIn("结束前删除", prompt)
         self.assertIn("timer_res_.csv", prompt)
-        self.assertIn("build the test target", prompt)
+        self.assertIn("构建测试目标", prompt)
         self.assertIn("Visual Studio 17 2022", prompt)
         self.assertIn("-DDEVELOP_LAWS=ON", prompt)
         self.assertIn("-DTEST_LAWS=ON", prompt)
         self.assertIn("cmake --build", prompt)
-        self.assertIn("If the build fails because of tests you generated", prompt)
-        self.assertIn("After every generated-test fix, deletion, or replacement, build again", prompt)
-        self.assertIn("Repeat the build -> fix/delete/replace -> rebuild loop", prompt)
-        self.assertIn("add a replacement buildable test and rebuild again", prompt)
-        self.assertIn("any requested-count shortfall with reasons", prompt)
-        self.assertIn("delete that test and update `.gme-agent/generated_tests.md`", prompt)
+        self.assertIn("若构建失败由本次生成测试导致", prompt)
+        self.assertIn("每次修复、删除或替换生成测试后都必须重新构建", prompt)
+        self.assertIn("构建 -> 修复/删除/替换 -> 重新构建", prompt)
+        self.assertIn("必须补充新的可构建测试并再次构建", prompt)
+        self.assertIn("测试数量不足及其原因", prompt)
+        self.assertIn("删除该测试并同步更新 `.gme-agent/generated_tests.md`", prompt)
         self.assertIn("unresolved external/LNK2019", prompt)
-        self.assertIn("private/protected member access errors", prompt)
+        self.assertIn("private/protected 访问错误", prompt)
+        self.assertNotIn("You are working in the GME repository", prompt)
         self.assertNotIn("Generated test suite", prompt)
 
     def test_continue_generation_prompt_uses_existing_files_manifest_and_no_helpers(self) -> None:
         prompt = continue_test_generation_prompt("base", "extend coverage", "tests/gme")
 
         self.assertIn(".gme-agent/generated_tests.json", prompt)
-        self.assertIn("appropriate existing `.cpp` files", prompt)
-        self.assertIn("Do not create `gme_agent_<module>_generated_test.cpp`", prompt)
-        self.assertIn("Do not add new helper functions", prompt)
-        self.assertIn("directly inside each individual `TEST_F` body", prompt)
-        self.assertIn("Write generated tests as `TEST_F` cases", prompt)
-        self.assertIn("delete any temporary files outside", prompt)
+        self.assertIn("职责最匹配的现有 `.cpp` 文件", prompt)
+        self.assertIn("不要创建 `gme_agent_<module>_generated_test.cpp`", prompt)
+        self.assertIn("不要新增 helper 函数", prompt)
+        self.assertIn("必须直接写在各自的 `TEST_F` 函数体内", prompt)
+        self.assertIn("生成的测试必须使用 `TEST_F`", prompt)
+        self.assertIn("结束前删除", prompt)
         self.assertIn("timer_res_.csv", prompt)
-        self.assertIn("build the test target", prompt)
+        self.assertIn("构建测试目标", prompt)
         self.assertIn("Visual Studio 17 2022", prompt)
         self.assertIn("-DDEVELOP_BASE=ON", prompt)
         self.assertIn("-DTEST_BASE=ON", prompt)
         self.assertIn("cmake --build", prompt)
-        self.assertIn("If the build fails because of tests you generated", prompt)
-        self.assertIn("After every generated-test fix, deletion, or replacement, build again", prompt)
-        self.assertIn("Repeat the build -> fix/delete/replace -> rebuild loop", prompt)
-        self.assertIn("add a replacement buildable test and rebuild again", prompt)
-        self.assertIn("any requested-count shortfall with reasons", prompt)
-        self.assertIn("delete that test and update `.gme-agent/generated_tests.md`", prompt)
+        self.assertIn("若构建失败由本次生成测试导致", prompt)
+        self.assertIn("每次修复、删除或替换生成测试后都必须重新构建", prompt)
+        self.assertIn("构建 -> 修复/删除/替换 -> 重新构建", prompt)
+        self.assertIn("必须补充新的可构建测试并再次构建", prompt)
+        self.assertIn("测试数量不足及其原因", prompt)
+        self.assertIn("删除该测试并同步更新 `.gme-agent/generated_tests.md`", prompt)
         self.assertIn("unresolved external/LNK2019", prompt)
-        self.assertIn("private/protected member access errors", prompt)
+        self.assertIn("private/protected 访问错误", prompt)
+        self.assertNotIn("You are continuing an existing", prompt)
         self.assertNotIn("Generated test suite", prompt)
 
     def test_generation_prompt_uses_task_specific_build_guidance(self) -> None:
@@ -339,6 +813,38 @@ TEST_F(Suite, GeneratedB) {
 
         self.assertIn("custom-build-command", prompt)
         self.assertNotIn("-DDEVELOP_LAWS=ON", prompt)
+
+    def test_generation_prompt_uses_structured_interface_selection(self) -> None:
+        selected = [
+            {
+                "id": "laws.api-make-cubic.abc",
+                "unique_symbol": "outcome api_make_cubic(double, double, double, double, double, double, law *&)",
+                "target_file": "tests/gme/src/laws/kernel_kernapi_test.cpp",
+                "test_suite": "Laws_KernapiTest",
+            },
+            {
+                "id": "laws.law-zero.def",
+                "unique_symbol": "int law::zero(double) const",
+                "target_file": "tests/gme/src/laws/law_base_test.cpp",
+                "test_suite": "Laws_BaseTest",
+            },
+        ]
+
+        prompt = test_generation_prompt(
+            "laws",
+            "selected interfaces",
+            "tests/gme",
+            selected_interfaces=selected,
+            tests_per_interface=2,
+            extra_requirements="cover tolerance boundaries",
+        )
+
+        self.assertIn("共生成 4 个新测试", prompt)
+        self.assertIn("tests/gme/src/laws/kernel_kernapi_test.cpp", prompt)
+        self.assertIn("outcome api_make_cubic", prompt)
+        self.assertIn("fixture `Laws_BaseTest`", prompt)
+        self.assertIn("不得修改所选文件之外的测试 `.cpp`", prompt)
+        self.assertIn("cover tolerance boundaries", prompt)
 
     def test_generated_tests_manifest_normalizes_files_and_filter(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -394,6 +900,29 @@ TEST_F(Suite, GeneratedB) {
             with self.assertRaisesRegex(RuntimeError, "existing test files"):
                 ensure_generated_tests_use_existing_files(worktree, "tests/gme", ["src/laws/new_agent_test.cpp"])
 
+    def test_generated_tests_manifest_stays_in_selected_files(self) -> None:
+        manifest = {
+            "tests": [
+                {
+                    "file": "src/laws/kernel_kernapi_test.cpp",
+                    "suite": "Laws_KernapiTest",
+                    "name": "SelectedCase",
+                }
+            ]
+        }
+
+        ensure_generated_tests_use_selected_files(
+            manifest,
+            "tests/gme",
+            ["tests/gme/src/laws/kernel_kernapi_test.cpp"],
+        )
+        with self.assertRaisesRegex(RuntimeError, "selected target files"):
+            ensure_generated_tests_use_selected_files(
+                manifest,
+                "tests/gme",
+                ["tests/gme/src/laws/law_base_test.cpp"],
+            )
+
     def test_commit_paths_only_commits_selected_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
@@ -429,7 +958,8 @@ TEST_F(Suite, GeneratedB) {
         captured: dict[str, list[str]] = {}
 
         class Proc:
-            stdout = "https://example.invalid/pull/1\n"
+            stdout = "Warning: 1 uncommitted change\nhttps://example.invalid/pull/1\n"
+            stderr = ""
             returncode = 0
 
         def fake_run(cmd: list[str], **_kwargs: object) -> Proc:
@@ -456,6 +986,66 @@ TEST_F(Suite, GeneratedB) {
 
         self.assertRegex(first, r"^gme-agent/skip-laws-\d{8}-\d{6}-06437831-[0-9a-f]{6}$")
         self.assertNotEqual(first, second)
+
+    def test_selected_pr_branch_name_is_unique_test_branch(self) -> None:
+        first = _selected_pr_branch_name({"id": "06437831-a6a2", "module": "laws"})
+        second = _selected_pr_branch_name({"id": "06437831-a6a2", "module": "laws"})
+
+        self.assertRegex(first, r"^gme-agent/tests-laws-\d{8}-\d{6}-06437831-[0-9a-f]{6}$")
+        self.assertNotEqual(first, second)
+
+    def test_selected_manifest_tests_preserves_request_order_and_rejects_unknown(self) -> None:
+        manifest = [
+            {"file": "src/laws/a.cpp", "suite": "Suite", "name": "First"},
+            {"file": "src/laws/b.cpp", "suite": "Suite", "name": "Second"},
+        ]
+
+        selected = _selected_manifest_tests(
+            manifest,
+            [
+                {"suite": "Suite", "name": "Second"},
+                {"suite": "Suite", "name": "First"},
+            ],
+        )
+
+        self.assertEqual([item["name"] for item in selected], ["Second", "First"])
+        with self.assertRaisesRegex(RuntimeError, "generated_tests.json"):
+            _selected_manifest_tests(manifest, [{"suite": "Suite", "name": "Missing"}])
+
+    def test_selected_tests_are_classified_from_latest_output_and_failures(self) -> None:
+        output = """
+[       OK ] Suite.Passing (1 ms)
+[  SKIPPED ] Suite.AlreadySkipped (0 ms)
+[  FAILED  ] Suite.Failing (1 ms)
+"""
+        passing, skipped, failures = _classify_selected_tests(
+            {("Suite", "Passing"), ("Suite", "AlreadySkipped"), ("Suite", "Failing")},
+            [{"id": "gmefail-1", "test_suite": "Suite", "test_name": "Failing"}],
+            output,
+        )
+
+        self.assertEqual(passing, {("Suite", "Passing")})
+        self.assertEqual(skipped, {("Suite", "AlreadySkipped")})
+        self.assertEqual([item["id"] for item in failures], ["gmefail-1"])
+
+    def test_selected_tests_reject_unknown_status(self) -> None:
+        with self.assertRaisesRegex(RuntimeError, "unconfirmed"):
+            _classify_selected_tests({("Suite", "Unknown")}, [], "[       OK ] Suite.Other (1 ms)")
+
+    def test_selected_pr_body_lists_all_selected_tests(self) -> None:
+        selected = [
+            {"suite": "Suite", "name": "Passing"},
+            {"suite": "Suite", "name": "Failing"},
+        ]
+        body = _selected_pr_body(
+            selected,
+            [{"test_suite": "Suite", "test_name": "Failing"}],
+        )
+
+        self.assertIn("本次新增测试用例：", body)
+        self.assertIn("Suite.Passing", body)
+        self.assertIn("Suite.Failing", body)
+        self.assertIn("增加 skip", body)
 
     def test_skip_pr_body_uses_chinese_plain_text(self) -> None:
         body = _skip_pr_body(
@@ -572,6 +1162,66 @@ TEST_F(LawsKernapiTest, GeneratedFailingCase) {
             self.assertIn("TEST_F(LawsKernapiTest, GeneratedFailingCase)", pruned)
             self.assertIn("GTEST_SKIP()", pruned)
             self.assertNotIn("GeneratedPassingCase", pruned)
+
+    def test_prune_manifest_tests_keeps_only_selected_generated_tests(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp)
+            rel_path = "src/laws/law_base_test.cpp"
+            file_path = target / rel_path
+            file_path.parent.mkdir(parents=True)
+            file_path.write_text(
+                """TEST_F(LawsBaseTest, ExistingManualCase) {
+    EXPECT_TRUE(true);
+}
+
+TEST_F(LawsBaseTest, GeneratedPassingCase) {
+    EXPECT_TRUE(true);
+}
+
+TEST_F(LawsBaseTest, GeneratedFailingCase) {
+    GTEST_SKIP() << "[gme-agent-known-failure:gmefail-1] mismatch";
+}
+
+TEST_F(LawsBaseTest, GeneratedUnselectedCase) {
+    EXPECT_TRUE(true);
+}
+""",
+                encoding="utf-8",
+            )
+
+            manifest = [
+                {"file": rel_path, "suite": "LawsBaseTest", "name": "GeneratedPassingCase"},
+                {"file": rel_path, "suite": "LawsBaseTest", "name": "GeneratedFailingCase"},
+                {"file": rel_path, "suite": "LawsBaseTest", "name": "GeneratedUnselectedCase"},
+            ]
+            _prune_manifest_tests_to_selection(
+                target,
+                [rel_path],
+                {("LawsBaseTest", "GeneratedPassingCase"), ("LawsBaseTest", "GeneratedFailingCase")},
+                {("LawsBaseTest", "GeneratedFailingCase")},
+                manifest,
+                lambda _level, _message: None,
+            )
+
+            pruned = file_path.read_text(encoding="utf-8")
+            self.assertIn("ExistingManualCase", pruned)
+            self.assertIn("GeneratedPassingCase", pruned)
+            self.assertIn("GeneratedFailingCase", pruned)
+            self.assertNotIn("GeneratedUnselectedCase", pruned)
+
+    def test_selected_pr_verification_requires_each_expected_status(self) -> None:
+        output = """
+[       OK ] Suite.Passing (1 ms)
+[  SKIPPED ] Suite.Failing (0 ms)
+"""
+        selected = {("Suite", "Passing"), ("Suite", "Failing")}
+        _require_selected_tests_reported(output, selected)
+        _validate_selected_test_results(output, {("Suite", "Passing")}, {("Suite", "Failing")})
+
+        with self.assertRaisesRegex(RuntimeError, "did not appear"):
+            _require_selected_tests_reported(output, selected | {("Suite", "Missing")})
+        with self.assertRaisesRegex(RuntimeError, "expected SKIPPED"):
+            _validate_selected_test_results(output, set(), {("Suite", "Passing")})
 
     def test_generated_test_snapshot_restore_keeps_local_full_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

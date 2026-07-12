@@ -20,17 +20,18 @@ RUNNING_JOB_STATUSES = {
 
 def delete_job_record(ctx, job_id: str, *, cleanup_worktree: bool = True, delete_artifacts: bool = True) -> dict[str, Any]:
     job = ctx.db.get_job(job_id)
+    emit = ctx._job_emit(job_id)
     if job.get("status") in RUNNING_JOB_STATUSES:
-        raise RuntimeError(f"Cannot delete a running job: {job_id}")
+        emit("warn", f"Deleting stale job record with non-active status: {job.get('status')}")
 
     deleted_worktree = False
     deleted_artifacts = False
-    emit = ctx._job_emit(job_id)
 
     if cleanup_worktree:
-        path = job.get("worktree_path")
-        if path:
-            worktree_path = Path(path)
+        paths = job_worktree_paths(ctx, job)
+        if not paths:
+            emit("warn", "Job has no recorded or discoverable worktree to delete.")
+        for worktree_path in paths:
             if worktree_path.exists():
                 try:
                     emit("info", f"Deleting worktree {worktree_path}")
@@ -60,3 +61,29 @@ def delete_job_record(ctx, job_id: str, *, cleanup_worktree: bool = True, delete
         "deleted_artifacts": deleted_artifacts,
     }
 
+
+def job_worktree_paths(ctx, job: dict[str, Any]) -> list[Path]:
+    root = Path(ctx.config.worktree_root).resolve()
+    result: list[Path] = []
+    seen: set[Path] = set()
+
+    def add_candidate(path: str | Path) -> None:
+        candidate = Path(path).resolve()
+        if candidate == root or root not in candidate.parents:
+            return
+        if candidate not in seen:
+            seen.add(candidate)
+            result.append(candidate)
+
+    path = job.get("worktree_path")
+    if path:
+        add_candidate(path)
+
+    job_id = str(job.get("id") or "")
+    token = job_id[:8]
+    if token and root.exists():
+        for child in root.iterdir():
+            if child.is_dir() and child.name.endswith(token):
+                add_candidate(child)
+
+    return result

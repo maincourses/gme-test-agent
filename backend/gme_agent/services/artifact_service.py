@@ -27,5 +27,6 @@ def write_job_artifacts(ctx, job_id: str, worktree: Path, artifact_dir: Path) ->
         "target_repo": target_repo,
         "target_repo_path": str(target_path),
         "failures": [f for f in ctx.db.list_failures() if f.get("job_id") == job_id],
+        "test_results": ctx.db.list_test_case_results(job_id),
     }
     (artifact_dir / "manifest.json").write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")

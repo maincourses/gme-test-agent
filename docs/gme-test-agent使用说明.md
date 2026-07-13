@@ -17,7 +17,100 @@
 - 已执行 `gh auth login`，并且账号有目标测试仓库的 push/PR 权限
 
 
-## 2. 获取工具
+## 2. Codex 账号与 API Key
+
+GME Test Agent 不单独保存 OpenAI 账号或 API Key。工具通过 `openai-codex` SDK 启动 Codex，并复用当前 Windows 用户已经保存的 Codex 登录状态。
+
+登录 Codex 和登录 GitHub 是两件独立的事情：
+
+- Codex 登录用于生成测试和修复代码。
+- `gh auth login` 用于推送分支和创建 GitHub PR。
+
+### 2.1 使用 ChatGPT 账号登录
+
+可以打开 Codex App，使用自己的 ChatGPT 账号完成登录；也可以在终端运行：
+
+```powershell
+codex login
+```
+
+按照浏览器提示完成登录后，检查状态：
+
+```powershell
+codex login status
+```
+
+确认登录成功后，关闭并重新打开 GME Test Agent，再执行“环境检查”。Agent 必须与 Codex 登录使用同一个 Windows 用户。
+
+### 2.2 使用 OpenAI API Key 登录
+
+API Key 可以从 OpenAI Platform 的 API Keys 页面创建：
+
+```text
+https://platform.openai.com/api-keys
+```
+
+在 PowerShell 中执行：
+
+```powershell
+$env:OPENAI_API_KEY = "你的 API Key"
+$env:OPENAI_API_KEY | codex login --with-api-key
+codex login status
+```
+
+`codex login --with-api-key` 会将 API Key 登录状态保存给当前 Windows 用户。登录成功后，不需要把 API Key 写入 GME Test Agent 的配置文件，直接启动 Agent 即可复用该认证状态。
+
+仅设置 `$env:OPENAI_API_KEY` 而不执行 `codex login --with-api-key`，不应作为 Agent 的固定使用方式。建议始终通过 `codex login status` 确认 Codex 已经识别当前认证方式。
+
+也可以在 Codex App 的未登录页面选择使用 API Key 登录。完成后仍建议运行：
+
+```powershell
+codex login status
+```
+
+如果 CLI 未识别 App 中的 API Key 登录状态，请再执行一次前面的 `codex login --with-api-key` 命令。
+
+### 2.3 API Key 计费与模型权限
+
+- 使用 API Key 时，消耗计入对应 OpenAI Platform 组织或项目，按照 API 标准价格计费。
+- API Key 费用与 ChatGPT Plus、Pro 等订阅额度相互独立。
+- API Key 所属项目必须已经启用计费并具有足够额度。
+- Agent“设置”页中的 `model` 必须是该 API Key 有权访问的模型。
+- API Key 登录支持本地 Codex 工作流，但部分依赖 ChatGPT 工作区或云服务的功能可能不可用。
+
+官方认证说明：
+
+```text
+https://developers.openai.com/codex/auth
+```
+
+### 2.4 切换账号或认证方式
+
+先退出当前 Codex 登录：
+
+```powershell
+codex logout
+```
+
+然后重新使用 ChatGPT 账号或 API Key 登录，并确认：
+
+```powershell
+codex login status
+```
+
+切换完成后重新启动 GME Test Agent。已经运行中的 Agent 后端不会自动切换到新的认证状态。
+
+### 2.5 API Key 安全要求
+
+- 不要把 API Key 写入 `config.local.json`。
+- 不要把 API Key 写入 Skill、prompt、日志、源码或测试文件。
+- 不要将 API Key 提交到 GitHub。
+- 不要在截图、作业报告或聊天记录中暴露完整 API Key。
+- 不建议使用 `setx OPENAI_API_KEY` 将 Key 长期保存为系统环境变量。
+- API Key 泄露后应立即在 OpenAI Platform 中撤销并创建新 Key。
+- 多人使用时，每个人应使用自己的账号或 API Key，不要共享同一个个人 Key。
+
+## 3. 获取工具
 
 ```text
 GME Test Agent-0.1.0-x64.exe
@@ -25,7 +118,7 @@ GME Test Agent-0.1.0-x64.exe
 
 使用者双击 exe 即可启动。
 
-## 3. 第一次启动会自动创建什么
+## 4. 第一次启动会自动创建什么
 
 第一次打开时，工具会在当前 Windows 用户的应用数据目录下创建自己的本地数据。
 
@@ -55,7 +148,7 @@ logs\
 
 使用者不需要提前准备数据库。`gme_agent.db` 不存在时，后端会自动创建。
 
-## 4. 首次配置
+## 5. 首次配置
 
 启动后进入“设置”页，重点检查这些配置：
 
@@ -71,7 +164,7 @@ logs\
 
 环境检查通过后再开始生成测试。
 
-## 5. 生成测试流程
+## 6. 生成测试流程
 
 进入“测试 Agent”页：
 
@@ -89,7 +182,7 @@ logs\
 - 构建日志
 - 测试结果
 
-## 6. 构建和运行测试
+## 7. 构建和运行测试
 
 如果任务生成后还没有构建或运行，可以手动点击：
 
@@ -107,7 +200,7 @@ logs\
 - 行号
 - 失败原因
 
-## 7. 加 skip 并创建 PR
+## 8. 加 skip 并创建 PR
 
 如果确认当前失败是 GME 和 ACIS 的真实差异，可以点击：
 
@@ -137,7 +230,7 @@ GTEST_SKIP() << "[gme-agent-known-failure:gmefail-xxx] reason";
 - PR 中 generated test 文件会被裁剪为只包含本次失败并加 skip 的测试。
 - 本地任务 worktree 会保留完整 generated 文件，方便继续扩展。
 
-## 8. 继续扩展已有任务
+## 9. 继续扩展已有任务
 
 如果想在已有任务基础上继续生成测试：
 
@@ -150,7 +243,7 @@ GTEST_SKIP() << "[gme-agent-known-failure:gmefail-xxx] reason";
 
 每次 skip PR 都会创建新的独立 skip 分支。
 
-## 9. 数据和日志位置
+## 10. 数据和日志位置
 
 如果需要排查问题，可以查看：
 
@@ -179,7 +272,7 @@ C:\Users\<用户名>\AppData\Roaming\GME Test Agent\worktrees\
 
 具体路径也可以在“设置”页查看。
 
-## 10. 常见问题
+## 11. 常见问题
 
 ### 环境检查提示 Codex auth 失败
 
@@ -225,4 +318,3 @@ gh auth login
 
 - `clang-format` 是否在 PATH 中
 - 当前 GME worktree 根目录是否有 `.clang-format`
-

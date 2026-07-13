@@ -12,7 +12,7 @@ $env:VITE_API_TOKEN = $ApiToken
 $env:VITE_BACKEND_PORT = [string]$BackendPort
 
 if (-not (Test-Path "node_modules")) {
-    npm install
+    npm ci
 }
 
 npm run dev -- --port $Port

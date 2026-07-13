@@ -1,8 +1,8 @@
 {
-  "gme_repo_path": "D:/GME",
-  "worktree_root": "D:/projects/gme-test-agent/worktrees",
-  "artifact_root": "D:/projects/gme-test-agent/artifacts",
-  "database_path": "D:/projects/gme-test-agent/gme_agent.db",
+  "gme_repo_path": "C:/path/to/GME",
+  "worktree_root": "./worktrees",
+  "artifact_root": "./artifacts",
+  "database_path": "./gme_agent.db",
   "base_branch": "main",
   "github_remote": "origin",
   "model": "gpt-5.5",

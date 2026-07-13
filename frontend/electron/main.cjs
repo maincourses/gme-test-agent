@@ -8,7 +8,7 @@ const path = require("node:path");
 const BACKEND_HOST = "127.0.0.1";
 const BACKEND_PORT = Number(process.env.GME_AGENT_BACKEND_PORT || "8765");
 const BACKEND_URL = `http://${BACKEND_HOST}:${BACKEND_PORT}`;
-const CONDA_ENV = process.env.GME_AGENT_CONDA_ENV || "py311";
+const CONDA_ENV = process.env.GME_AGENT_CONDA_ENV || "";
 const API_TOKEN = process.env.GME_AGENT_API_TOKEN || crypto.randomBytes(32).toString("hex");
 process.env.GME_AGENT_API_TOKEN = API_TOKEN;
 
@@ -160,15 +160,14 @@ async function startBackend() {
     command = backendExe;
     commandArgs = backendArgs;
     cwd = path.dirname(backendExe);
-  } else if (!command) {
+  } else if (!command && CONDA_ENV) {
     const conda = await findCondaCommand();
     if (conda) {
       command = conda;
       commandArgs = ["run", "-n", CONDA_ENV, "python", backendScript, ...backendArgs];
-    } else {
-      command = "python";
     }
   }
+  if (!command) command = "python";
 
   backendProcess = spawn(command, commandArgs, {
     cwd,

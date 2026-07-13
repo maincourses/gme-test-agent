@@ -1,11 +1,12 @@
 param(
     [string]$Python = "",
-    [string]$CondaEnv = "py311",
+    [string]$CondaEnv = "",
     [switch]$SkipInstall
 )
 
 $ErrorActionPreference = "Stop"
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
+. (Join-Path $PSScriptRoot "python_runtime.ps1")
 $RuntimeRoot = Join-Path $Root "backend-runtime"
 $PyInstallerRoot = Join-Path $Root "artifacts\pyinstaller"
 $BuildRoot = Join-Path $PyInstallerRoot "build"
@@ -16,11 +17,13 @@ $BackendPath = Join-Path $Root "backend"
 function Invoke-BackendPython {
     param([string[]]$Arguments)
     if ($Python) {
-        & $Python @Arguments
+        $PythonExe = Resolve-AgentPython -Python $Python
+        & $PythonExe @Arguments
     } elseif ($CondaEnv) {
         & conda run -n $CondaEnv python @Arguments
     } else {
-        & python @Arguments
+        $PythonExe = Resolve-AgentPython
+        & $PythonExe @Arguments
     }
 }
 

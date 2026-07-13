@@ -2,7 +2,7 @@ param(
     [ValidateSet("portable", "unpacked")]
     [string]$Target = "portable",
     [string]$Python = "",
-    [string]$CondaEnv = "py311",
+    [string]$CondaEnv = "",
     [switch]$SkipBackend
 )
 
@@ -19,7 +19,7 @@ $env:ELECTRON_MIRROR = "https://npmmirror.com/mirrors/electron/"
 $env:ELECTRON_BUILDER_BINARIES_MIRROR = "https://npmmirror.com/mirrors/electron-builder-binaries/"
 
 if (-not (Test-Path "node_modules")) {
-    npm install
+    npm ci
 }
 
 if ($Target -eq "portable") {

@@ -9,6 +9,7 @@ from .git.worktree import normalize_repo_path
 
 
 GENERATED_TESTS_MANIFEST = ".gme-agent/generated_tests.json"
+UTF8_BOM = b"\xef\xbb\xbf"
 
 
 def load_generated_tests_manifest(worktree: str | Path, target_repo: str = "tests/gme") -> dict[str, Any]:
@@ -16,7 +17,11 @@ def load_generated_tests_manifest(worktree: str | Path, target_repo: str = "test
     if not path.exists():
         return {"tests": [], "files": [], "gtest_filter": ""}
 
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    content = path.read_bytes()
+    has_bom = content.startswith(UTF8_BOM)
+    raw = json.loads(content.decode("utf-8-sig"))
+    if has_bom:
+        path.write_bytes(content[len(UTF8_BOM) :])
     if isinstance(raw, list):
         raw_tests = raw
     elif isinstance(raw, dict):

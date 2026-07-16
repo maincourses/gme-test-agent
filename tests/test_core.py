@@ -883,6 +883,44 @@ TEST_F(Suite, Case) {
                 "Laws_KernapiTest.ApiMakeCubicAsymmetricEndpointSlopes:Laws_ClassTest.LawZeroConstantPredicate",
             )
 
+    def test_generated_tests_manifest_accepts_bom_and_normalizes_to_utf8(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            notes = worktree / ".gme-agent"
+            notes.mkdir()
+            path = notes / "generated_tests.json"
+            content = """{
+  "tests": [
+    {
+      "file": "src/laws/law_base_test.cpp",
+      "suite": "Laws_BaseTest",
+      "name": "GeneratedChineseCommentCase",
+      "api": "中文接口"
+    }
+  ]
+}
+""".encode("utf-8")
+            path.write_bytes(b"\xef\xbb\xbf" + content)
+
+            manifest = load_generated_tests_manifest(worktree, "tests/gme")
+
+            self.assertEqual(manifest["tests"][0]["api"], "中文接口")
+            self.assertEqual(path.read_bytes(), content)
+
+    def test_generated_tests_manifest_does_not_rewrite_invalid_bom_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            worktree = Path(tmp)
+            notes = worktree / ".gme-agent"
+            notes.mkdir()
+            path = notes / "generated_tests.json"
+            content = b"\xef\xbb\xbf{invalid json}"
+            path.write_bytes(content)
+
+            with self.assertRaises(json.JSONDecodeError):
+                load_generated_tests_manifest(worktree, "tests/gme")
+
+            self.assertEqual(path.read_bytes(), content)
+
     def test_generated_tests_manifest_is_required(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaisesRegex(RuntimeError, "generated_tests.json"):

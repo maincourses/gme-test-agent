@@ -100,8 +100,9 @@ class CodexRunner:
             if not skill_dir:
                 self.emit("warn", f"Built-in Codex skill not found: {name}")
                 continue
-            self.emit("info", f"Using built-in Codex skill: {name} ({skill_dir})")
-            inputs.append(skill_input_type(name=name, path=str(skill_dir)))
+            skill_file = (skill_dir / "SKILL.md").resolve()
+            self.emit("info", f"Using built-in Codex skill: {name} ({skill_file})")
+            inputs.append(skill_input_type(name=name, path=str(skill_file)))
         return inputs
 
     @staticmethod

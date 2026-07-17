@@ -8,6 +8,10 @@ const {
   configForm,
   branchOptions,
   remoteOptions,
+  modelOptions,
+  selectedModelOption,
+  isCustomModel,
+  reasoningEffortOptions,
   sandboxOptions,
   approvalPolicyOptions,
   saveConfig,
@@ -97,10 +101,25 @@ const {
             </select>
           </label>
         </div>
-        <label class="field">
-          <span>模型</span>
-          <input v-model="configForm.model" />
-        </label>
+        <div class="two-col">
+          <label class="field">
+            <span>模型</span>
+            <select v-model="selectedModelOption">
+              <option v-for="item in modelOptions" :key="item.id" :value="item.id">
+                {{ item.display_name }}
+              </option>
+            </select>
+            <input v-if="isCustomModel" v-model.trim="configForm.model" placeholder="输入模型 ID，例如 gpt-5.6-sol" />
+          </label>
+          <label class="field">
+            <span>推理强度</span>
+            <select v-model="configForm.reasoning_effort">
+              <option v-for="item in reasoningEffortOptions" :key="item.value" :value="item.value">
+                {{ item.label }}
+              </option>
+            </select>
+          </label>
+        </div>
         <div class="two-col">
           <label class="field">
             <span>沙箱</span>

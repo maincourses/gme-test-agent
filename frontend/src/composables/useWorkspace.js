@@ -62,11 +62,15 @@ const interfaceCatalogLoading = ref(false);
 const interfaceSearch = ref("");
 const activeCatalogFile = ref("");
 const selectedInterfaceIds = ref([]);
+const CUSTOM_MODEL_VALUE = "__custom__";
 
 const configOptions = ref({
   branches: [],
   remotes: [],
   modules: [],
+  models: [],
+  reasoning_efforts: ["low", "medium", "high", "xhigh"],
+  model_error: "",
   sandbox_options: ["workspace-write", "read-only", "danger-full-access"],
   approval_policy_options: ["never", "auto_review"],
 });
@@ -79,6 +83,7 @@ const configForm = reactive({
   base_branch: "",
   github_remote: "",
   model: "",
+  reasoning_effort: "",
   sandbox: "",
   approval_policy: "",
   initialize_submodules: false,
@@ -452,6 +457,56 @@ const moduleOptions = computed(() => {
 });
 const sandboxOptions = computed(() => withCurrent(configOptions.value.sandbox_options, configForm.sandbox));
 const approvalPolicyOptions = computed(() => withCurrent(configOptions.value.approval_policy_options, configForm.approval_policy));
+const modelOptions = computed(() => {
+  return [
+    ...(configOptions.value.models || []),
+    { id: CUSTOM_MODEL_VALUE, display_name: "自定义模型" },
+  ];
+});
+const selectedModelOption = computed({
+  get() {
+    return (configOptions.value.models || []).some((item) => item.id === configForm.model)
+      ? configForm.model
+      : CUSTOM_MODEL_VALUE;
+  },
+  set(value) {
+    configForm.model = value === CUSTOM_MODEL_VALUE ? "" : value;
+  },
+});
+const isCustomModel = computed(() => selectedModelOption.value === CUSTOM_MODEL_VALUE);
+const supportedReasoningEfforts = computed(() => {
+  const model = (configOptions.value.models || []).find((item) => item.id === configForm.model);
+  return model?.supported_reasoning_efforts?.length
+    ? model.supported_reasoning_efforts
+    : configOptions.value.reasoning_efforts || [];
+});
+const reasoningEffortOptions = computed(() => {
+  const labels = { none: "无", minimal: "最小", low: "低", medium: "中", high: "高", xhigh: "超高" };
+  return [...new Set(supportedReasoningEfforts.value)].map((value) => ({ value, label: labels[value] || value }));
+});
+
+watch(
+  [
+    () => configForm.model,
+    () => configForm.reasoning_effort,
+    () => configOptions.value.models,
+    () => configOptions.value.reasoning_efforts,
+  ],
+  () => {
+    const model = (configOptions.value.models || []).find((item) => item.id === configForm.model);
+    const supported = supportedReasoningEfforts.value;
+    if (!supported.length || supported.includes(configForm.reasoning_effort)) return;
+    const preferred = model?.default_reasoning_effort;
+    if (preferred && supported.includes(preferred)) {
+      configForm.reasoning_effort = preferred;
+    } else if (supported.includes("medium")) {
+      configForm.reasoning_effort = "medium";
+    } else {
+      configForm.reasoning_effort = supported[0];
+    }
+  },
+  { deep: true, immediate: true },
+);
 
 let noticeTimer = null;
 
@@ -574,6 +629,10 @@ export function useWorkspace() {
     moduleOptions,
     sandboxOptions,
     approvalPolicyOptions,
+    modelOptions,
+    selectedModelOption,
+    isCustomModel,
+    reasoningEffortOptions,
     refreshAll,
     refreshRuntime,
     loadSelectedJobData,
@@ -661,7 +720,14 @@ async function loadConfig() {
 
 async function loadConfigOptions() {
   try {
-    configOptions.value = { ...configOptions.value, ...(await api.getOptions()) };
+    const [options, modelData] = await Promise.all([api.getOptions(), api.getModels()]);
+    configOptions.value = {
+      ...configOptions.value,
+      ...options,
+      models: modelData.models || [],
+      reasoning_efforts: modelData.reasoning_efforts || configOptions.value.reasoning_efforts,
+      model_error: modelData.error || "",
+    };
   } catch (err) {
     setError(err);
   }

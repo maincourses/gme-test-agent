@@ -63,6 +63,7 @@ from gme_agent.prompts import (
     test_generation_prompt,
 )
 from gme_agent.settings.config import AgentConfig, load_config, save_config
+from gme_agent.settings.models import serialize_codex_models
 from gme_agent.settings.options import load_config_options
 from gme_agent.settings.validation import validate_config
 from gme_agent.storage.db import AgentDb
@@ -89,11 +90,12 @@ class CoreTests(unittest.TestCase):
     def test_config_roundtrip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.json"
-            cfg = AgentConfig(gme_repo_path="D:/GME", model="gpt-5.5")
+            cfg = AgentConfig(gme_repo_path="D:/GME", model="gpt-5.5", reasoning_effort="high")
             save_config(path, cfg)
             loaded = load_config(path)
             self.assertEqual(Path(loaded.gme_repo_path), Path("D:/GME"))
             self.assertEqual(loaded.model, "gpt-5.5")
+            self.assertEqual(loaded.reasoning_effort, "high")
             self.assertTrue(loaded.codex_enabled)
             self.assertFalse(loaded.auto_apply_skips)
             self.assertTrue(loaded.use_builtin_skills)
@@ -1441,6 +1443,20 @@ TEST_F(LawsBaseTest, GeneratedUnselectedCase) {
             self.assertIn("new_test.cpp", diff)
             self.assertIn("+TEST(Suite, Case) {}", diff)
 
+    def test_git_diff_uses_histogram_for_tracked_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch(
+                "gme_agent.git.diff.run_git",
+                side_effect=["diff --git a/test.cpp b/test.cpp\n", ""],
+            ) as run_git_mock:
+                diff = git_diff(tmp)
+
+            self.assertIn("diff --git", diff)
+            self.assertEqual(
+                run_git_mock.call_args_list[0].args[0],
+                ["diff", "--histogram", "--", "."],
+            )
+
     def test_target_repo_path_selection(self) -> None:
         cfg = AgentConfig(test_target_repo="tests\\gme", module_repo_root="module")
         db = AgentDb(":memory:")
@@ -1641,6 +1657,95 @@ TEST_F(LawsBaseTest, GeneratedUnselectedCase) {
         self.assertIsNotNone(CodexRunner._builtin_skill_dir("gme-acis-interface-analyzer"))
         self.assertIsNotNone(CodexRunner._builtin_skill_dir("gme-test-writer"))
         self.assertIsNotNone(CodexRunner._builtin_skill_dir("gme-bug-fix"))
+
+    def test_codex_model_options_include_supported_reasoning_efforts(self) -> None:
+        class Value:
+            def __init__(self, value: str):
+                self.value = value
+
+        class EffortOption:
+            def __init__(self, value: str):
+                self.reasoning_effort = Value(value)
+
+        class Model:
+            id = "gpt-test"
+            display_name = "GPT Test"
+            description = "Test model"
+            default_reasoning_effort = Value("medium")
+            supported_reasoning_efforts = [EffortOption("low"), EffortOption("high")]
+
+        response = type("Response", (), {"data": [Model()]})()
+
+        self.assertEqual(
+            serialize_codex_models(response),
+            [
+                {
+                    "id": "gpt-test",
+                    "display_name": "GPT Test",
+                    "description": "Test model",
+                    "default_reasoning_effort": "medium",
+                    "supported_reasoning_efforts": ["low", "high"],
+                }
+            ],
+        )
+
+    def test_codex_reasoning_effort_uses_selected_value(self) -> None:
+        class FakeEffort:
+            def __init__(self, value: str):
+                if value not in {"low", "high"}:
+                    raise ValueError(value)
+                self.value = value
+
+        self.assertIsNone(CodexRunner._reasoning_effort("", FakeEffort))
+        self.assertEqual(CodexRunner._reasoning_effort("HIGH", FakeEffort).value, "high")
+        with self.assertRaisesRegex(RuntimeError, "Unsupported Codex reasoning effort"):
+            CodexRunner._reasoning_effort("invalid", FakeEffort)
+
+    def test_codex_run_inputs_explicitly_invoke_resolved_skills(self) -> None:
+        class FakeTextInput:
+            def __init__(self, text: str):
+                self.text = text
+
+        runner = CodexRunner(AgentConfig(), lambda _level, _message: None)
+        inputs = runner._run_inputs(
+            "生成测试",
+            ["gme-test-generation", "gme-test-writer"],
+            FakeTextInput,
+        )
+
+        self.assertEqual(
+            inputs[0].text,
+            "$gme-test-generation\n$gme-test-writer\n\n生成测试",
+        )
+        self.assertEqual(len(inputs), 1)
+
+    def test_codex_run_inputs_do_not_invoke_disabled_builtin_skills(self) -> None:
+        class FakeInput:
+            def __init__(self, text: str = "", **values):
+                self.text = text
+                self.values = values
+
+        runner = CodexRunner(AgentConfig(use_builtin_skills=False), lambda _level, _message: None)
+        inputs = runner._run_inputs("生成测试", [], FakeInput)
+
+        self.assertEqual(len(inputs), 1)
+        self.assertEqual(inputs[0].text, "生成测试")
+
+    def test_codex_stages_skills_in_repository_discovery_path_and_cleans_them(self) -> None:
+        events = []
+        runner = CodexRunner(AgentConfig(), lambda level, message: events.append((level, message)))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            skill_path = Path(tmp) / ".agents" / "skills" / "gme-test-generation" / "SKILL.md"
+            with runner._staged_skills(tmp, ["gme-test-generation", "missing-skill"]) as names:
+                self.assertEqual(names, ["gme-test-generation"])
+                self.assertTrue(skill_path.is_file())
+                self.assertIn("name: gme-test-generation", skill_path.read_text(encoding="utf-8"))
+
+            self.assertFalse(skill_path.exists())
+            self.assertFalse((Path(tmp) / ".agents").exists())
+
+        self.assertTrue(any(level == "warn" and "missing-skill" in message for level, message in events))
 
     def test_test_generation_loads_staged_skills(self) -> None:
         db = AgentDb(":memory:")

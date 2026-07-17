@@ -30,6 +30,7 @@ class AgentConfig:
     base_branch: str = "main"
     github_remote: str = "origin"
     model: str = "gpt-5.5"
+    reasoning_effort: str = ""
     sandbox: str = "workspace-write"
     approval_policy: str = "never"
     initialize_submodules: bool = False

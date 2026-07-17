@@ -28,6 +28,7 @@ export const api = {
   getConfig: () => request("/config"),
   saveConfig: (data) => request("/config", { method: "POST", body: JSON.stringify(data) }),
   getOptions: () => request("/options"),
+  getModels: () => request("/models"),
   listInterfaceCatalogs: () => request("/interface-catalogs"),
   getInterfaceCatalog: (module) => request(`/interface-catalogs/${encodeURIComponent(module)}`),
   validate: () => request("/validate"),

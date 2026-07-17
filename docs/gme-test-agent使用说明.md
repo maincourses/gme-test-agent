@@ -158,7 +158,8 @@ logs\
 - `database_path`：本地数据库路径，首次启动会自动指向本机应用数据目录
 - `base_branch`：创建任务 worktree 的基础分支，通常是 `main`
 - `github_remote`：远端名，通常是 `origin`
-- `model`：Codex 使用的模型
+- `model`：Codex 使用的模型；可从当前账户可用模型中选择，也可以选择“自定义模型”后输入模型 ID
+- `reasoning_effort`：推理强度；设置页会根据所选模型提供具体可用档位
 
 配置完成后，点击“环境检查”。
 

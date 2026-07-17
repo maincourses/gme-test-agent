@@ -57,7 +57,9 @@ def git_diff(path: str | Path, emit: EventCallback | None = None) -> str:
     repo = Path(path)
     chunks: list[str] = []
 
-    tracked_diff = run_git(["diff", "--", "."], repo, emit)
+    # Histogram diff aligns repetitive TEST_F blocks more reliably, avoiding
+    # large false deletion counts when generated tests are inserted between them.
+    tracked_diff = run_git(["diff", "--histogram", "--", "."], repo, emit)
     if tracked_diff.strip():
         chunks.append(tracked_diff.rstrip())
 

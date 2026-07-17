@@ -15,6 +15,7 @@ from ..services.interface_catalog_service import (
     selectable_interface_catalog,
 )
 from ..settings.config import AgentConfig, config_from_json, load_config, save_config
+from ..settings.models import load_codex_model_options
 from ..settings.options import load_config_options
 from ..settings.validation import validate_config
 from ..storage.db import AgentDb
@@ -101,6 +102,8 @@ class ApiHandler(BaseHTTPRequestHandler):
                 self._send_json(validate_config(self.server_state.config))
             elif path == "/api/options":
                 self._send_json(load_config_options(self.server_state.config))
+            elif path == "/api/models":
+                self._send_json(load_codex_model_options(self.server_state.config))
             elif path == "/api/interface-catalogs":
                 self._send_json(list_selectable_interface_catalogs())
             elif path.startswith("/api/interface-catalogs/"):

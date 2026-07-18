@@ -263,6 +263,6 @@ def _build_validation_guidance(ctx, worktree: Path, artifact_dir: Path) -> str:
   `{configure_command}`
 - 构建：
   `{build_command}`
-- 构建成功后，等 `.gme-agent/generated_tests.json` 提供准确 filter，再进行可选的聚焦运行：
+- 构建成功后，等 `.gme-agent/generated_tests.json` 提供准确 filter，必须运行本次所有生成测试；仅构建通过不算完成：
   `{test_command}`
 - 这些命令是本任务的权威命令。若命令因生成测试代码失败，必须在最终回复前修复或删除对应生成测试。"""

@@ -775,6 +775,11 @@ TEST_F(Suite, Case) {
         self.assertIn("删除该测试并同步更新 `.gme-agent/generated_tests.md`", prompt)
         self.assertIn("unresolved external/LNK2019", prompt)
         self.assertIn("private/protected 访问错误", prompt)
+        self.assertIn("完整 `UniqueSymbol`、类名和方法名搜索目标测试仓库", prompt)
+        self.assertIn("逐条总结其测试名、输入和断言", prompt)
+        self.assertIn("只生成这些已有测试尚未覆盖的行为", prompt)
+        self.assertIn("必须使用 `.gme-agent/generated_tests.json` 生成的准确 GTest filter 实际运行", prompt)
+        self.assertIn("仅构建通过不算完成", prompt)
         self.assertNotIn("You are working in the GME repository", prompt)
         self.assertNotIn("Generated test suite", prompt)
 
@@ -802,6 +807,11 @@ TEST_F(Suite, Case) {
         self.assertIn("删除该测试并同步更新 `.gme-agent/generated_tests.md`", prompt)
         self.assertIn("unresolved external/LNK2019", prompt)
         self.assertIn("private/protected 访问错误", prompt)
+        self.assertIn("完整 `UniqueSymbol`、类名和方法名搜索目标测试仓库", prompt)
+        self.assertIn("逐条总结其测试名、输入和断言", prompt)
+        self.assertIn("只生成这些已有测试尚未覆盖的行为", prompt)
+        self.assertIn("必须使用 `.gme-agent/generated_tests.json` 生成的准确 GTest filter 实际运行", prompt)
+        self.assertIn("仅构建通过不算完成", prompt)
         self.assertNotIn("You are continuing an existing", prompt)
         self.assertNotIn("Generated test suite", prompt)
 

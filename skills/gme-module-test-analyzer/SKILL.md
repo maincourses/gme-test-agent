@@ -17,6 +17,8 @@ description: 分析用户选择的 GME 模块已有测试。用于 GME 测试 Ag
 
 本步骤只做分析，不修改测试代码或生产代码。
 
+分析每个目标接口前，必须按完整 `UniqueSymbol`、类名和方法名搜索目标测试仓库，不能只依赖文件名、目录归属或模糊 API 名。若找到对应测试，必须逐条阅读测试体并记录其测试名、输入和断言。
+
 ## 需要提取的信息
 
 记录以下内容：
@@ -27,6 +29,7 @@ description: 分析用户选择的 GME 模块已有测试。用于 GME 测试 Ag
 - fixture、helper、对象生命周期包装、容差和比较工具
 - 已有 GME vs ACIS 对比模式
 - 已覆盖 API 和行为类型
+- 每个目标接口对应的已有测试，以及每条测试使用的输入和断言
 - suite/test 命名习惯
 - 新测试应该插入哪个已有 `.cpp` 文件
 - 不需要新增 helper 即可扩展的覆盖空白
@@ -59,6 +62,8 @@ description: 分析用户选择的 GME 模块已有测试。用于 GME 测试 Ag
 ## Existing Comparison Patterns
 
 ## Covered APIs
+
+## Existing Matching Tests
 
 ## Coverage Gaps
 

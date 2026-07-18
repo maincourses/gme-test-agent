@@ -63,6 +63,8 @@ def test_generation_prompt(
 - 不要新增 helper 函数、helper 类、helper 头文件、宏或共享工具。每个测试的构造、转换、比较和清理逻辑必须直接写在各自的 `TEST_F` 函数体内。
 - 生成的测试必须使用 `TEST_F`，不要使用独立的 `TEST`。
 - 复用目标文件已有的 fixture/suite。只有目标文件没有可用 fixture 且测试无法编译时，才允许创建新 fixture。
+- 生成某个接口的测试前，必须使用完整 `UniqueSymbol`、类名和方法名搜索目标测试仓库，定位所有对应的已有测试；不得只按文件名或模糊 API 名判断是否已有覆盖。
+- 若存在对应测试，必须在 `.gme-agent/module_test_profile.md` 中逐条总结其测试名、输入和断言，并且只生成这些已有测试尚未覆盖的行为。
 - 每个测试应放在相同 API、类型或行为的最近现有测试附近。
 - 遵循目标文件已有的 include 风格、命名、初始化、容差、对象生命周期和 ACIS/GME 对比方式。
 - 优先编写小型、确定性的测试，不要编写宽泛的随机测试。
@@ -74,6 +76,7 @@ def test_generation_prompt(
 - 删除无效测试导致数量少于用户要求时，必须补充新的可构建测试并再次构建。只有不存在安全可对比 API、API 不可链接、只能访问 private/protected 成员或缺少可靠 GME/ACIS 对比方式时，才允许最终数量不足，并在最终回复中说明原因。
 - 构建失败修复只能修改本次生成的测试和 `.gme-agent` 工作笔记。不得为了让测试通过构建而修改 GME 生产代码、ACIS 代码、CMake 文件、共享 helper 或无关测试。
 - 遇到 unresolved external/LNK2019，视为该 API 无法在当前测试目标中链接，删除或替换该测试。遇到 private/protected 访问错误，视为测试无效，改用公开行为验证。
+- 构建成功后，必须使用 `.gme-agent/generated_tests.json` 生成的准确 GTest filter 实际运行本次所有生成测试；仅构建通过不算完成。若测试异常退出或未产生 `OK`、`FAILED`、`SKIPPED` 结果，必须分析并修正无效测试后重新构建、重新运行。
 - 如果本地构建工具不可用，在最终回复中准确说明原因，不得声称构建通过。
 - 第一次生成时不要添加 `GTEST_SKIP`。runner 会先执行测试，再针对真实差异请求受控的 skip。
 
@@ -138,7 +141,7 @@ def continue_test_generation_prompt(
 
 必须执行的流程：
 1. 如果存在，读取 `.gme-agent/module_test_profile.md`、`.gme-agent/acis_interface_candidates.md`、`.gme-agent/generated_tests.md` 和 `.gme-agent/generated_tests.json`。
-2. 重新检查附近已有测试，避免重复。
+2. 使用每个接口的完整 `UniqueSymbol`、类名和方法名重新搜索目标测试仓库；若存在对应测试，在 `.gme-agent/module_test_profile.md` 中逐条总结其测试名、输入和断言，避免重复已有行为。
 3. 将新的聚焦测试添加到适当的现有 `.cpp` 文件，不要创建 generated test 文件。
 4. 更新 `.gme-agent/generated_tests.json`，使其包含本任务之前生成和本次新增的全部测试。
 5. 更新 `.gme-agent/generated_tests.md`，记录新测试和准确的 GTest filter 变化。只有新分析确实改变内容时，才更新其他 `.gme-agent/*.md` 工作笔记。
@@ -153,6 +156,8 @@ def continue_test_generation_prompt(
 - 不要新增 helper 函数、helper 类、helper 头文件、宏或共享工具。每个测试的构造、转换、比较和清理逻辑必须直接写在各自的 `TEST_F` 函数体内。
 - 生成的测试必须使用 `TEST_F`，不要使用独立的 `TEST`。
 - 复用目标文件已有的 fixture/suite。只有目标文件没有可用 fixture 且测试无法编译时，才允许创建新 fixture。
+- 生成某个接口的测试前，必须使用完整 `UniqueSymbol`、类名和方法名搜索目标测试仓库，定位所有对应的已有测试；不得只按文件名或模糊 API 名判断是否已有覆盖。
+- 若存在对应测试，只生成这些已有测试尚未覆盖的行为。
 - 每个测试应放在相同 API、类型或行为的最近现有测试附近。
 - 优先编写小型、确定性的 GME/ACIS 对比测试，并覆盖已有测试尚未覆盖的场景。
 - 不要调用 private/protected 成员。不要因为头文件存在声明就假设 API 可链接；优先使用已有测试采用的 API，或通过实现/导出符号确认。
@@ -161,6 +166,7 @@ def continue_test_generation_prompt(
 - 删除无效测试导致数量少于用户要求时，必须补充新的可构建测试并再次构建。只有不存在安全可对比 API、API 不可链接、只能访问 private/protected 成员或缺少可靠 GME/ACIS 对比方式时，才允许最终数量不足，并在最终回复中说明原因。
 - 构建失败修复只能修改本次生成的测试和 `.gme-agent` 工作笔记。不得为了让测试通过构建而修改 GME 生产代码、ACIS 代码、CMake 文件、共享 helper 或无关测试。
 - 遇到 unresolved external/LNK2019，视为该 API 无法在当前测试目标中链接，删除或替换该测试。遇到 private/protected 访问错误，视为测试无效，改用公开行为验证。
+- 构建成功后，必须使用 `.gme-agent/generated_tests.json` 生成的准确 GTest filter 实际运行本次所有生成测试；仅构建通过不算完成。若测试异常退出或未产生 `OK`、`FAILED`、`SKIPPED` 结果，必须分析并修正无效测试后重新构建、重新运行。
 - 如果本地构建工具不可用，在最终回复中准确说明原因，不得声称构建通过。
 - 本次扩展不要添加 `GTEST_SKIP`。
 
@@ -223,7 +229,7 @@ def _build_guidance_block(module_path: str, build_guidance: str | None) -> str:
   `cmake -S {{worktree}} -B {{worktree}}/build/vscode -G "Visual Studio 17 2022" -A x64 -DBUILD_ALL_MODULE=OFF -DBUILD_DEMO=OFF -DBUILD_BENCHTEST=OFF -DBUILD_TEST=ON -DBUILD_FORMAT=OFF {develop_option} {test_option}`
 - 构建：
   `cmake --build {{worktree}}/build/vscode --config Debug --target tests --parallel`
-- 构建成功后，可以使用 `.gme-agent/generated_tests.json` 中的准确 filter 聚焦运行：
+- 构建成功后，必须使用 `.gme-agent/generated_tests.json` 中的准确 filter 运行本次所有生成测试；仅构建通过不算完成：
   `{{worktree}}/build/vscode/Debug/tests.exe --gtest_filter=<exact-generated-filter>`"""
 
 
